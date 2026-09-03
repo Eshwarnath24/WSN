@@ -1,0 +1,28 @@
+# Environment files (Sensitive Credentials)
+.env
+.env.*
+!.env.example
+*.env
+
+# Operating System Files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Node & Build artifacts (if bundlers/servers used)
+node_modules/
+dist/
+build/
+*.log
+
+# Arduino / PlatformIO build artifacts
+.pio/
+*.hex
+*.bin
+*.elf
