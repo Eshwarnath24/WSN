@@ -38,14 +38,21 @@ export const NODE_CONFIGS = {
     category: "Proximity / Detection",
     sensorName: "IR Sensor",
     datasets: [
-      { label: "IR Intensity", color: "#38bdf8", glow: "rgba(56, 189, 248, 0.4)" }
+      { label: "IR State (0/1)", color: "#38bdf8", glow: "rgba(56, 189, 248, 0.4)" }
     ],
+    min: 0,
+    max: 1,
     suggestedMin: 0,
-    suggestedMax: 4096,
+    suggestedMax: 1,
+    stepSize: 1,
+    precision: 0,
+    grace: 0,
+    tension: 0,
+    decimals: 0,
     hasAnomaly: false,
     defaultTrend: "—",
     defaultValues: { single: "NA" },
-    additional: "Detection Range: ~2-30 cm"
+    additional: "Digital State: 0 or 1"
   }
 };
 
@@ -264,7 +271,7 @@ export function createNodeCard(container, nodeId) {
     borderWidth: 1.8,
     pointRadius: 0,
     pointHoverRadius: 4,
-    tension: 0.35,
+    tension: config.tension !== undefined ? config.tension : 0.35,
     fill: false
   }));
 
@@ -298,13 +305,23 @@ export function createNodeCard(container, nodeId) {
         y: {
           display: true,
           grace: config.grace !== undefined ? config.grace : '10%',
+          ...(config.min !== undefined ? { min: config.min } : {}),
+          ...(config.max !== undefined ? { max: config.max } : {}),
           suggestedMin: config.suggestedMin ?? 0,
           suggestedMax: config.suggestedMax ?? 100,
           ticks: {
             color: "#64748b",
             font: { family: "JetBrains Mono", size: 9 },
             ...(config.stepSize !== undefined ? { stepSize: config.stepSize } : {}),
-            maxTicksLimit: config.maxTicksLimit ?? (config.stepSize ? 12 : 5)
+            ...(config.precision !== undefined ? { precision: config.precision } : {}),
+            maxTicksLimit: config.maxTicksLimit ?? (config.stepSize ? 12 : 5),
+            callback: function(value) {
+              if (config.stepSize === 1 && config.max === 1) {
+                if (value === 0 || value === 1) return value;
+                return '';
+              }
+              return value;
+            }
           },
           grid: {
             color: "rgba(255, 255, 255, 0.04)",
@@ -346,7 +363,16 @@ export function createNodeCard(container, nodeId) {
     } else {
       const sEl = document.getElementById(`val-single-${nodeId}`);
       if (sEl && v1 !== undefined) {
-        const formatted = typeof v1 === 'number' ? v1.toFixed(1) : v1;
+        let formatted = v1;
+        if (typeof v1 === 'number') {
+          if (config.decimals !== undefined) {
+            formatted = v1.toFixed(config.decimals);
+          } else if (Number.isInteger(v1)) {
+            formatted = v1;
+          } else {
+            formatted = v1.toFixed(1);
+          }
+        }
         sEl.textContent = formatted;
       }
     }
