@@ -182,6 +182,15 @@ void setup() {
     return;
   }
   esp_now_register_recv_cb(OnDataRecv);
+
+  // ---- NEW: reset all known nodes to inactive at boot, clearing stale Firebase state ----
+  Serial.println("[Startup] Resetting all node statuses to inactive...");
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodes[i].nodeId != "N4") {  // N4 is the gateway itself, skip
+      setNodeStatus(nodes[i].nodeId, "", false);
+    }
+  }
+
   Serial.println("[ESP-NOW] Ready. Waiting for sensor data...");
   Serial.println("===== SETUP COMPLETE =====\n");
 }
