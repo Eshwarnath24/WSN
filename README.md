@@ -285,12 +285,12 @@ FIREBASE_MESSAGING_SENDER_ID="805607252"
 FIREBASE_APP_ID="1:805607252:web:..."
 ```
 
-### Dynamic Loader in `firebase-config.js`:
-The client configuration module asynchronously fetches and parses `.env` at initialization:
-1. Parses key-value pairs from `.env` via ES Module top-level `await`.
-2. Inspects bundler variables (`import.meta.env` or `VITE_` prefix) if compiled with Vite.
-3. Inspects runtime globals (`window.__ENV__`) if injected by a container or reverse proxy.
-4. Validates configuration integrity and reports descriptive console diagnostics if credentials are missing.
+### Configuration in `firebase-config.js`:
+The client configuration module initializes Firebase cleanly and reliably:
+1. Inspects bundler variables (`import.meta.env` or `VITE_` prefix) if compiled with Vite.
+2. Inspects runtime globals (`window.__ENV__`) if injected by a container or reverse proxy.
+3. Falls back to pre-configured project credentials (`DEFAULT_CONFIG`) so it works immediately with VS Code Live Server, Python `http.server`, or static hosts without dotfile/404 issues.
+4. Validates configuration integrity and monitors RTDB connection state via `.info/connected`.
 
 ---
 

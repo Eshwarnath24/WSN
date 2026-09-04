@@ -2,40 +2,19 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/fireba
 import { getDatabase } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
 /**
- * Parses simple KEY="VALUE" or KEY=VALUE lines from .env text
+ * Firebase Project Configuration
+ * Default credentials for the ESP32 Wireless Sensor Network project.
+ * Can be overridden via window.__ENV__ or Vite environment variables.
  */
-function parseEnv(text) {
-  const env = {};
-  if (!text) return env;
-  const lines = text.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx !== -1) {
-      const key = trimmed.slice(0, eqIdx).trim();
-      let val = trimmed.slice(eqIdx + 1).trim();
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.slice(1, -1);
-      }
-      env[key] = val;
-    }
-  }
-  return env;
-}
-
-let loadedEnv = {};
-
-// Asynchronously load .env using top-level await in ES Module
-try {
-  const res = await fetch("./.env");
-  if (res.ok) {
-    const rawText = await res.text();
-    loadedEnv = parseEnv(rawText);
-  }
-} catch (err) {
-  console.warn("[Firebase Config] Could not load .env directly via fetch:", err);
-}
+const DEFAULT_CONFIG = {
+  apiKey: "AIzaSyAgiQYFCgjkdKbU5VqQQHHLQCvAldQTW2M",
+  authDomain: "wsn-project-bb012.firebaseapp.com",
+  databaseURL: "https://wsn-project-bb012-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "wsn-project-bb012",
+  storageBucket: "wsn-project-bb012.firebasestorage.app",
+  messagingSenderId: "805607252",
+  appId: "1:805607252:web:4383ea3054a5e183071ac1"
+};
 
 function getEnv(key) {
   // 1. Bundler environment (Vite / Rollup / Webpack)
@@ -51,30 +30,28 @@ function getEnv(key) {
     return window.__ENV__[key];
   }
 
-  // 3. Loaded .env key or VITE_ prefixed key
-  if (loadedEnv[key]) return loadedEnv[key];
-  if (loadedEnv[`VITE_${key}`]) return loadedEnv[`VITE_${key}`];
-
   return "";
 }
 
 const firebaseConfig = {
-  apiKey: getEnv("FIREBASE_API_KEY"),
-  authDomain: getEnv("FIREBASE_AUTH_DOMAIN"),
-  databaseURL: getEnv("FIREBASE_DATABASE_URL"),
-  projectId: getEnv("FIREBASE_PROJECT_ID"),
-  storageBucket: getEnv("FIREBASE_STORAGE_BUCKET"),
-  messagingSenderId: getEnv("FIREBASE_MESSAGING_SENDER_ID"),
-  appId: getEnv("FIREBASE_APP_ID")
+  apiKey: getEnv("FIREBASE_API_KEY") || DEFAULT_CONFIG.apiKey,
+  authDomain: getEnv("FIREBASE_AUTH_DOMAIN") || DEFAULT_CONFIG.authDomain,
+  databaseURL: getEnv("FIREBASE_DATABASE_URL") || DEFAULT_CONFIG.databaseURL,
+  projectId: getEnv("FIREBASE_PROJECT_ID") || DEFAULT_CONFIG.projectId,
+  storageBucket: getEnv("FIREBASE_STORAGE_BUCKET") || DEFAULT_CONFIG.storageBucket,
+  messagingSenderId: getEnv("FIREBASE_MESSAGING_SENDER_ID") || DEFAULT_CONFIG.messagingSenderId,
+  appId: getEnv("FIREBASE_APP_ID") || DEFAULT_CONFIG.appId
 };
 
 if (!firebaseConfig.apiKey || !firebaseConfig.databaseURL) {
   console.error(
-    "[Firebase Config] Missing Firebase credentials! Ensure 'dashboard/.env' exists with valid FIREBASE_* configuration values."
+    "[Firebase Config] Missing Firebase credentials! Ensure valid FIREBASE_* configuration values are set."
   );
 }
 
 const app = initializeApp(firebaseConfig);
 const db = getDatabase(app);
+
+console.log("[Firebase Config] Firebase initialized successfully with database:", firebaseConfig.databaseURL);
 
 export { db, firebaseConfig };

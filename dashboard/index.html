@@ -56,6 +56,130 @@
 
   <main class="dashboard-content">
 
+    <!-- COMBINED NETWORK QoS METRICS -->
+    <section class="network-qos" id="network-qos">
+      <div class="nq-header">
+        <div class="nq-title-row">
+          <svg class="nq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+          </svg>
+          <h2 class="nq-title">Network QoS</h2>
+          <span class="nq-subtitle">Combined Link Performance</span>
+        </div>
+      </div>
+
+      <div class="nq-grid">
+        <!-- PDR -->
+        <div class="nq-card nq-card-highlight" id="nq-pdr-card">
+          <div class="nq-card-label">Packet Delivery Ratio</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value" id="nq-pdr-val">—</span>
+            <span class="nq-card-unit">%</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-pdr-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Expected -->
+        <div class="nq-card">
+          <div class="nq-card-label">Total Expected</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value cyan" id="nq-expected-val">—</span>
+            <span class="nq-card-unit">pkts</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-expected-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Received -->
+        <div class="nq-card">
+          <div class="nq-card-label">Total Received</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value green" id="nq-received-val">—</span>
+            <span class="nq-card-unit">pkts</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-received-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Lost -->
+        <div class="nq-card">
+          <div class="nq-card-label">Total Lost</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value" id="nq-lost-val">—</span>
+            <span class="nq-card-unit">pkts</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-lost-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Duplicates -->
+        <div class="nq-card">
+          <div class="nq-card-label">Duplicates</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value amber" id="nq-dup-val">—</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-dup-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Out-of-Order -->
+        <div class="nq-card">
+          <div class="nq-card-label">Out-of-Order</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value amber" id="nq-ooo-val">—</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-ooo-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- RSSI -->
+        <div class="nq-card">
+          <div class="nq-card-label">Avg RSSI</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value" id="nq-rssi-val">—</span>
+            <span class="nq-card-unit">dBm</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-rssi-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+
+        <!-- Ack Delay -->
+        <div class="nq-card">
+          <div class="nq-card-label">Avg Ack Delay</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value" id="nq-ack-val">—</span>
+            <span class="nq-card-unit">ms</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-ack-breakdown">
+            <span class="nq-chip">N1: —</span>
+            <span class="nq-chip">N2: —</span>
+            <span class="nq-chip">N3: —</span>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <!-- SENSOR NODES CONTAINER -->
     <section class="nodes-stream" id="grid">

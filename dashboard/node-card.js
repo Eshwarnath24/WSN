@@ -10,7 +10,11 @@ export const NODE_CONFIGS = {
       { label: "Y-Axis", color: "#22c55e", glow: "rgba(34, 197, 94, 0.4)" },
       { label: "Z-Axis", color: "#c084fc", glow: "rgba(192, 132, 252, 0.5)" }
     ],
-
+    suggestedMin: -10,
+    suggestedMax: 40,
+    stepSize: 10,
+    maxTicksLimit: 12,
+    grace: 0,
     hasAnomaly: false,
     defaultTrend: "—",
     defaultValues: { x: "NA", y: "NA", z: "NA" }
@@ -22,6 +26,8 @@ export const NODE_CONFIGS = {
     datasets: [
       { label: "Flame Intensity", color: "#10b981", glow: "rgba(16, 185, 129, 0.4)" }
     ],
+    suggestedMin: -500,
+    suggestedMax: 5000,
     hasAnomaly: false,
     defaultTrend: "—",
     defaultValues: { single: "NA" },
@@ -29,15 +35,17 @@ export const NODE_CONFIGS = {
   },
   N3: {
     code: "ESP32-NODE-03",
-    category: "Power Grid Monitor",
-    sensorName: "AC Voltage Sensor",
+    category: "Proximity / Detection",
+    sensorName: "IR Sensor",
     datasets: [
-      { label: "AC Voltage", color: "#38bdf8", glow: "rgba(56, 189, 248, 0.4)" }
+      { label: "IR Intensity", color: "#38bdf8", glow: "rgba(56, 189, 248, 0.4)" }
     ],
+    suggestedMin: 0,
+    suggestedMax: 4096,
     hasAnomaly: false,
     defaultTrend: "—",
     defaultValues: { single: "NA" },
-    additional: "Nominal: 220 V"
+    additional: "Detection Range: ~2-30 cm"
   }
 };
 
@@ -159,35 +167,18 @@ export function createNodeCard(container, nodeId) {
     `;
   }
 
-  // Build Status & Anomaly HTML
-  let statusBadgeHtml = "";
-  let statusSidebarHtml = "";
-  if (config.hasAnomaly) {
-    statusBadgeHtml = `
-      <div class="badge badge-anomaly" id="badge-${nodeId}">
-        <span class="anomaly-icon">✦</span>
-        <span>ANOMALY</span>
-      </div>
-    `;
-    statusSidebarHtml = `
-      <div class="status-pill anomaly" id="status-pill-${nodeId}">
-        <span>⚠</span> <span>ANOMALY DETECTED</span>
-      </div>
-      <div class="alert-message" id="alert-msg-${nodeId}">! SPIKE on Y-Axis - 4.7g</div>
-    `;
-  } else {
-    statusBadgeHtml = `
-      <div class="badge badge-active" id="badge-${nodeId}">
-        <span class="status-dot"></span>
-        <span id="badge-text-${nodeId}">ACTIVE</span>
-      </div>
-    `;
-    statusSidebarHtml = `
-      <div class="status-pill normal" id="status-pill-${nodeId}">
-        <span>✓</span> <span>Normal</span>
-      </div>
-    `;
-  }
+  // Cards initialize in INACTIVE / Offline state until Firebase confirms active status
+  const statusBadgeHtml = `
+    <div class="badge badge-inactive" id="badge-${nodeId}">
+      <span class="status-dot"></span>
+      <span id="badge-text-${nodeId}">INACTIVE</span>
+    </div>
+  `;
+  const statusSidebarHtml = `
+    <div class="status-pill normal" id="status-pill-${nodeId}" style="color: #f87171; border-color: rgba(248, 113, 113, 0.3);">
+      <span>✕</span> <span>Offline</span>
+    </div>
+  `;
 
   // Trend Class
   let trendClass = "stable";
@@ -262,10 +253,13 @@ export function createNodeCard(container, nodeId) {
 
   container.appendChild(card);
 
-  // Setup Chart Datasets
+  // Setup Chart Datasets initialized with a dead line (flatline at 0)
+  const INITIAL_POINTS = 30;
+  const initialLabels = Array.from({ length: INITIAL_POINTS }, () => "");
+
   const chartDatasets = config.datasets.map((ds) => ({
     label: ds.label,
-    data: [],
+    data: new Array(INITIAL_POINTS).fill(0),
     borderColor: ds.color,
     borderWidth: 1.8,
     pointRadius: 0,
@@ -278,7 +272,7 @@ export function createNodeCard(container, nodeId) {
   const chart = new Chart(ctx, {
     type: "line",
     data: {
-      labels: [],
+      labels: initialLabels,
       datasets: chartDatasets
     },
     options: {
@@ -303,11 +297,14 @@ export function createNodeCard(container, nodeId) {
         },
         y: {
           display: true,
-          grace: '15%',
+          grace: config.grace !== undefined ? config.grace : '10%',
+          suggestedMin: config.suggestedMin ?? 0,
+          suggestedMax: config.suggestedMax ?? 100,
           ticks: {
             color: "#64748b",
             font: { family: "JetBrains Mono", size: 9 },
-            maxTicksLimit: 5
+            ...(config.stepSize !== undefined ? { stepSize: config.stepSize } : {}),
+            maxTicksLimit: config.maxTicksLimit ?? (config.stepSize ? 12 : 5)
           },
           grid: {
             color: "rgba(255, 255, 255, 0.04)",
@@ -334,7 +331,38 @@ export function createNodeCard(container, nodeId) {
   const detector = new AnomalyDetector({ windowSize: 30, warnAfter: 5, alertAfter: 10, zThreshold: 2 });
 
   // Helper: update sidebar status based on anomaly detector state
+  // Active state tracker for this node
+  let isNodeActive = false;
+  let latestValues = null;
+
+  function renderValues({ seq, v1, v2, v3, trendText }) {
+    if (config.datasets.length > 1) {
+      const xEl = document.getElementById(`val-x-${nodeId}`);
+      const yEl = document.getElementById(`val-y-${nodeId}`);
+      const zEl = document.getElementById(`val-z-${nodeId}`);
+      if (xEl && v1 !== undefined) xEl.textContent = `${typeof v1 === 'number' ? v1.toFixed(1) : v1}g`;
+      if (yEl && v2 !== undefined) yEl.textContent = `${typeof v2 === 'number' ? v2.toFixed(1) : v2}g`;
+      if (zEl && v3 !== undefined) zEl.textContent = `${typeof v3 === 'number' ? v3.toFixed(1) : v3}g`;
+    } else {
+      const sEl = document.getElementById(`val-single-${nodeId}`);
+      if (sEl && v1 !== undefined) {
+        const formatted = typeof v1 === 'number' ? v1.toFixed(1) : v1;
+        sEl.textContent = formatted;
+      }
+    }
+
+    if (trendText) {
+      const trendEl = document.getElementById(`trend-${nodeId}`);
+      if (trendEl) {
+        trendEl.textContent = trendText;
+        trendEl.className = "trend-val " + (trendText.includes("+") ? "up" : "stable");
+      }
+    }
+  }
+
+  // Helper: update sidebar status based on anomaly detector state
   function updateAnomalyStatus(state) {
+    if (!isNodeActive) return; // Never mark active if node is offline in Firebase
     const badge = document.getElementById(`badge-${nodeId}`);
     const statusContainer = document.getElementById(`status-container-${nodeId}`);
     if (!badge || !statusContainer) return;
@@ -372,12 +400,41 @@ export function createNodeCard(container, nodeId) {
     chart,
     config,
     detector,
+    isActive() {
+      return isNodeActive;
+    },
+    pushDeadPoint() {
+      const MAX_POINTS = 30;
+      const timeStr = new Date().toLocaleTimeString('en-GB');
+      chart.data.labels.push(timeStr);
+      if (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+      }
+
+      chart.data.datasets.forEach((ds) => {
+        ds.data.push(0);
+        if (ds.data.length > MAX_POINTS) {
+          ds.data.shift();
+        }
+      });
+
+      chart.update("none");
+    },
+    resetToDeadLine() {
+      const MAX_POINTS = 30;
+      chart.data.labels = Array.from({ length: MAX_POINTS }, () => "");
+      chart.data.datasets.forEach((ds) => {
+        ds.data = new Array(MAX_POINTS).fill(0);
+      });
+      chart.update("none");
+    },
     setStatus(isActive, isAnomaly = false) {
+      isNodeActive = Boolean(isActive);
       const badge = document.getElementById(`badge-${nodeId}`);
       const statusContainer = document.getElementById(`status-container-${nodeId}`);
       if (!badge || !statusContainer) return;
 
-      if (!isActive) {
+      if (!isNodeActive) {
         badge.className = "badge badge-inactive";
         badge.innerHTML = `<span class="status-dot"></span><span>INACTIVE</span>`;
         statusContainer.innerHTML = `
@@ -405,9 +462,11 @@ export function createNodeCard(container, nodeId) {
       } else if (isAnomaly) {
         // Anomaly state is now handled by the detector in pushChartPoint
         updateAnomalyStatus(detector.state !== 'NORMAL' ? detector.state : 'WARNING');
+        if (latestValues) renderValues(latestValues);
       } else {
         // Only set to active/normal if detector agrees
         updateAnomalyStatus(detector.state);
+        if (latestValues) renderValues(latestValues);
       }
     },
     setSensorType(type) {
@@ -417,29 +476,9 @@ export function createNodeCard(container, nodeId) {
       }
     },
     setLatestValues(seq, v1, v2, v3, trendText) {
-      if (config.datasets.length > 1) {
-        const xEl = document.getElementById(`val-x-${nodeId}`);
-        const yEl = document.getElementById(`val-y-${nodeId}`);
-        const zEl = document.getElementById(`val-z-${nodeId}`);
-        if (xEl && v1 !== undefined) xEl.textContent = `${typeof v1 === 'number' ? v1.toFixed(1) : v1}g`;
-        if (yEl && v2 !== undefined) yEl.textContent = `${typeof v2 === 'number' ? v2.toFixed(1) : v2}g`;
-        if (zEl && v3 !== undefined) zEl.textContent = `${typeof v3 === 'number' ? v3.toFixed(1) : v3}g`;
-      } else {
-        const sEl = document.getElementById(`val-single-${nodeId}`);
-        if (sEl && v1 !== undefined) {
-          const isAC = config.code.includes("03") || (typeof v1 === 'number' && v1 > 50);
-          const formatted = typeof v1 === 'number' ? (isAC ? v1.toFixed(1) : v1.toFixed(2)) : v1;
-          sEl.textContent = `${formatted} V`;
-        }
-      }
-
-      if (trendText) {
-        const trendEl = document.getElementById(`trend-${nodeId}`);
-        if (trendEl) {
-          trendEl.textContent = trendText;
-          trendEl.className = "trend-val " + (trendText.includes("+") ? "up" : "stable");
-        }
-      }
+      latestValues = { seq, v1, v2, v3, trendText };
+      if (!isNodeActive) return;
+      renderValues(latestValues);
     },
     pushChartPoint(label, v1, v2, v3) {
       const MAX_POINTS = 30;
@@ -469,10 +508,12 @@ export function createNodeCard(container, nodeId) {
         chart.data.labels.shift();
       }
 
-      chart.update();
+      chart.update("none");
 
-      // Auto-update sidebar anomaly status from detector
-      updateAnomalyStatus(detector.state);
+      // Auto-update sidebar anomaly status from detector only when online
+      if (isNodeActive) {
+        updateAnomalyStatus(detector.state);
+      }
     }
   };
 }
