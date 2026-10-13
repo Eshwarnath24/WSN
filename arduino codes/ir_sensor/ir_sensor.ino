@@ -4,10 +4,17 @@
 #include "esp_wifi.h"
 
 uint8_t receiverMAC[] = {0x8C, 0x94, 0xDF, 0x7C, 0x3F, 0x58}; // N4 gateway MAC
-#define N4_CHANNEL 11  // must match N4's printed channel
+#define MIN_CHANNEL 1
+#define MAX_CHANNEL 13
+#define CHANNEL_ACK_WAIT_MS 300
+#define RESCAN_FAIL_THRESHOLD 15   // after this many consecutive send failures, re-scan channels
+
+int lockedChannel = -1;
+volatile int consecutiveFails = 0;
 
 #define IR_DO_PIN 4    // confirmed working - digital only, active-low (1=clear, 0=blocked)
 #define DEBOUNCE_MS 50 // ignore state flips faster than this (comparator chatter guard)
+#define TELEMETRY_INTERVAL_MS 250 // Reduced delay for faster real-time telemetry (was 500ms)
 
 #define MSG_REGISTER      0
 #define MSG_REGISTER_ACK  1
@@ -42,9 +49,14 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   unsigned long now = millis();
   if (status == ESP_NOW_SEND_SUCCESS) {
     pendingAckDelay = now - lastSendMillis;
+    consecutiveFails = 0;
+  } else {
+    consecutiveFails++;
   }
   Serial.print("[ESP-NOW] Send status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+  Serial.print(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+  Serial.print(" | Channel: ");
+  Serial.println(lockedChannel);
 }
 
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -67,28 +79,37 @@ void sendPacket(uint8_t type) {
   esp_now_send(receiverMAC, (uint8_t *)&outData, sizeof(outData));
 }
 
-void registerWithGateway() {
-  Serial.println("[Register] Sending REGISTER to N4...");
-  outData.val1 = 0; outData.val2 = 0; outData.val3 = 0;
-  outData.seq_num = 0;
+void findGatewayAndRegister() {
+  registered = false;
+  int sweep = 0;
 
-  int attempts = 0;
-  while (!registered && attempts < 10) {
-    ackReceivedFlag = false;   // reset before each attempt, avoids stale-flag ambiguity
-    sendPacket(MSG_REGISTER);
-    unsigned long waitStart = millis();
-    while (!ackReceivedFlag && millis() - waitStart < 1000) {
-      delay(10);
+  while (!registered) {
+    sweep++;
+    Serial.print("[Channel Scan] Sweep #"); Serial.println(sweep);
+
+    for (int ch = MIN_CHANNEL; ch <= MAX_CHANNEL && !registered; ch++) {
+      esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+      ackReceivedFlag = false;
+      sendPacket(MSG_REGISTER);
+
+      unsigned long waitStart = millis();
+      while (!ackReceivedFlag && millis() - waitStart < CHANNEL_ACK_WAIT_MS) {
+        delay(5);
+      }
+
+      if (ackReceivedFlag) {
+        registered = true;
+        lockedChannel = ch;
+        consecutiveFails = 0;
+        Serial.print("[Channel Scan] Gateway found on channel ");
+        Serial.println(ch);
+      }
     }
-    if (registered) break;
-    attempts++;
-    Serial.println("[Register] No ACK yet, retrying...");
-  }
 
-  if (registered) {
-    Serial.println("[Register] N3 REGISTERED with gateway.");
-  } else {
-    Serial.println("[Register] No ACK after retries - proceeding anyway (ESP-NOW is connectionless).");
+    if (!registered) {
+      Serial.println("[Channel Scan] Gateway not found this sweep. Retrying in 1s...");
+      delay(1000);
+    }
   }
 }
 
@@ -103,9 +124,7 @@ void setup() {
   lastChangeTime = millis();
 
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(N4_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  Serial.print("[WiFi] Locked to channel: ");
-  Serial.println(N4_CHANNEL);
+  // Channel will be set dynamically by findGatewayAndRegister()
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -116,7 +135,7 @@ void setup() {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, receiverMAC, 6);
-  peerInfo.channel = N4_CHANNEL;
+  peerInfo.channel = 0;   // use whatever channel is currently set
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -125,7 +144,7 @@ void setup() {
   }
 
   Serial.println("N3 (IR) ESP-NOW Sender Ready");
-  registerWithGateway();
+  findGatewayAndRegister();
 }
 
 void loop() {
@@ -148,9 +167,14 @@ void loop() {
 
   sendPacket(MSG_SENSOR_DATA);
 
+  if (consecutiveFails >= RESCAN_FAIL_THRESHOLD) {
+    Serial.println("[Channel Scan] Too many failures - gateway may have changed channel. Rescanning...");
+    findGatewayAndRegister();
+  }
+
   Serial.print("Sent -> Obstacle: "); Serial.print(outData.val1 == 1 ? "YES" : "NO");
   Serial.print(" | Seq: "); Serial.print(outData.seq_num);
   Serial.print(" | PrevAckDelay: "); Serial.println(pendingAckDelay);
 
-  delay(500);
+  delay(TELEMETRY_INTERVAL_MS);
 }

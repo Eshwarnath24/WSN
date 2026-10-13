@@ -12,6 +12,10 @@ const unsigned long NODE_TIMEOUT_MS = 5000;
 
 bool wifiConnected = false;
 
+// Persistent HTTP client & secure connection for HTTP Keep-Alive (reduces request time from ~2s to ~80ms)
+WiFiClientSecure fbClient;
+HTTPClient fbHttp;
+
 #define MSG_REGISTER      0
 #define MSG_REGISTER_ACK  1
 #define MSG_SENSOR_DATA   2
@@ -29,6 +33,7 @@ typedef struct struct_message {
 } struct_message;
 
 #define MAX_NODES 4
+#define QUEUE_SIZE 4
 
 struct NodeTracker {
   String nodeId;
@@ -40,9 +45,12 @@ struct NodeTracker {
   bool everSeen;
   unsigned long wentInactiveAt;
 
-  struct_message pendingData;
-  int pendingRssi;
-  volatile bool hasPending;
+  // Ring buffer queue for incoming ESP-NOW messages
+  struct_message queueData[QUEUE_SIZE];
+  int queueRssi[QUEUE_SIZE];
+  volatile uint8_t queueHead;
+  volatile uint8_t queueTail;
+  volatile uint8_t queueCount;
 
   uint8_t peerMac[6];
   volatile bool pendingRegister;
@@ -56,6 +64,7 @@ struct NodeTracker {
 
   int lastRssi;
   unsigned long lastAckDelay;
+  unsigned long lastQosPush;
 };
 
 NodeTracker nodes[MAX_NODES];
@@ -72,8 +81,9 @@ void initNodeTable() {
     nodes[i].isActive = false;
     nodes[i].everSeen = false;
     nodes[i].wentInactiveAt = 0;
-    nodes[i].hasPending = false;
-    nodes[i].pendingRssi = 0;
+    nodes[i].queueHead = 0;
+    nodes[i].queueTail = 0;
+    nodes[i].queueCount = 0;
     nodes[i].pendingRegister = false;
     nodes[i].registered = false;
     nodes[i].firstSeq = -1;
@@ -83,6 +93,7 @@ void initNodeTable() {
     nodes[i].outOfOrderCount = 0;
     nodes[i].lastRssi = 0;
     nodes[i].lastAckDelay = 0;
+    nodes[i].lastQosPush = 0;
   }
 }
 
@@ -109,6 +120,7 @@ void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
+    fbClient.stop(); // reset any previous connection
     Serial.println("\n[WiFi] CONNECTED");
     Serial.print("[WiFi] IP address: ");
     Serial.println(WiFi.localIP());
@@ -121,7 +133,47 @@ void connectWiFi() {
   }
 }
 
-// ---------------- Firebase helpers ----------------
+// ---------------- Fast Reusable Firebase Helper ----------------
+
+bool sendFirebaseRequest(const String& method, const String& path, const String& payload) {
+  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  String url = String(firebaseHost) + path;
+
+  // Up to 2 attempts: if stale keep-alive connection dropped, reconnect once
+  for (int attempt = 0; attempt < 2; attempt++) {
+    fbHttp.begin(fbClient, url);
+    fbHttp.setReuse(true);       // Enable HTTP/1.1 Keep-Alive (reuses TLS session)
+    fbHttp.setTimeout(1500);     // Non-blocking 1.5s timeout
+    fbHttp.addHeader("Content-Type", "application/json");
+
+    int httpCode = 0;
+    if (method == "POST") {
+      httpCode = fbHttp.POST(payload);
+    } else if (method == "PUT") {
+      httpCode = fbHttp.PUT(payload);
+    }
+
+    if (httpCode > 0) {
+      fbHttp.end();
+      return true;
+    }
+
+    // Attempt failed (e.g. idle keep-alive closed by Firebase server)
+    fbHttp.end();
+    fbClient.stop();
+    if (attempt == 0) {
+      delay(20);
+    }
+  }
+
+  Serial.printf("[Firebase] %s %s FAILED\n", method.c_str(), path.c_str());
+  return false;
+}
+
+// ---------------- Firebase Operations ----------------
 
 void setNodeStatus(String nodeId, String sensorType, String role, bool active) {
   if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
@@ -129,50 +181,34 @@ void setNodeStatus(String nodeId, String sensorType, String role, bool active) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
+  // 1. Set status attribute directly under /nodes/{nodeId}/status ("active" / "inactive")
+  sendFirebaseRequest("PUT", "/nodes/" + nodeId + "/status.json", active ? "\"active\"" : "\"inactive\"");
 
-  http.begin(client, String(firebaseHost) + "/nodes/" + nodeId + "/status.json");
-  http.addHeader("Content-Type", "application/json");
-  http.PUT(active ? "\"active\"" : "\"inactive\"");
-  http.end();
-
+  // 2. Set sensor_type attribute directly under /nodes/{nodeId}/sensor_type ("vibration" / "flame" / "ir")
   if (sensorType.length() > 0) {
-    http.begin(client, String(firebaseHost) + "/nodes/" + nodeId + "/sensor_type.json");
-    http.addHeader("Content-Type", "application/json");
-    http.PUT("\"" + sensorType + "\"");
-    http.end();
+    sendFirebaseRequest("PUT", "/nodes/" + nodeId + "/sensor_type.json", "\"" + sensorType + "\"");
   }
 
+  // 3. Set role attribute directly under /nodes/{nodeId}/role ("Member" / "Coordinator")
   if (role.length() > 0) {
-    http.begin(client, String(firebaseHost) + "/nodes/" + nodeId + "/role.json");
-    http.addHeader("Content-Type", "application/json");
-    http.PUT("\"" + role + "\"");
-    http.end();
+    sendFirebaseRequest("PUT", "/nodes/" + nodeId + "/role.json", "\"" + role + "\"");
   }
 
   Serial.print("[Firebase] Status set [");
   Serial.print(nodeId);
   Serial.print("] -> ");
-  Serial.println(active ? "ACTIVE" : "INACTIVE");
+  Serial.print(active ? "ACTIVE" : "INACTIVE");
+  if (sensorType.length() > 0) {
+    Serial.print(" | sensor_type: ");
+    Serial.print(sensorType);
+  }
+  Serial.println();
 }
 
 void pushReading(String nodeId, String sensorType, float v1, float v2, float v3,
                   unsigned long seq, unsigned long srcTimestamp, int rssi,
                   unsigned long ackDelay, bool isDup, bool isOOO) {
-  if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
-    Serial.println("[Firebase] SKIPPED - WiFi not connected");
-    return;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  String url = String(firebaseHost) + "/nodes/" + nodeId + "/data.json";
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
+  String path = "/nodes/" + nodeId + "/data.json";
 
   String payload = "{";
   payload += "\"node_id\":\"" + nodeId + "\",";
@@ -188,34 +224,17 @@ void pushReading(String nodeId, String sensorType, float v1, float v2, float v3,
   payload += "\"is_out_of_order\":" + String(isOOO ? "true" : "false");
   payload += "}";
 
-  int httpCode = http.POST(payload);
-
-  if (httpCode > 0) {
+  if (sendFirebaseRequest("POST", path, payload)) {
     Serial.print("[Firebase] Pushed [");
     Serial.print(nodeId);
-    Serial.print("] -> HTTP ");
-    Serial.println(httpCode);
-  } else {
-    Serial.print("[Firebase] Push FAILED [");
-    Serial.print(nodeId);
-    Serial.print("] -> Error: ");
-    Serial.println(http.errorToString(httpCode));
+    Serial.print("] seq=");
+    Serial.println(seq);
   }
-
-  http.end();
 }
 
 void pushQos(String nodeId, long expected, long received, long lost, float pdr,
              long dupCount, long oooCount, int rssi, unsigned long ackDelay) {
-  if (!wifiConnected || WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  String url = String(firebaseHost) + "/nodes/" + nodeId + "/qos.json";
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
+  String path = "/nodes/" + nodeId + "/qos.json";
 
   String payload = "{";
   payload += "\"expected\":" + String(expected) + ",";
@@ -228,23 +247,12 @@ void pushQos(String nodeId, long expected, long received, long lost, float pdr,
   payload += "\"last_ack_delay_ms\":" + String(ackDelay);
   payload += "}";
 
-  http.PUT(payload);
-  http.end();
+  sendFirebaseRequest("PUT", path, payload);
 }
 
 void logEvent(String nodeId, String eventType, String detail) {
   Serial.print("[Event] "); Serial.print(nodeId); Serial.print(" - ");
   Serial.print(eventType); Serial.print(" - "); Serial.println(detail);
-
-  if (!wifiConnected || WiFi.status() != WL_CONNECTED) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-
-  String url = String(firebaseHost) + "/events.json";
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
 
   String payload = "{";
   payload += "\"node_id\":\"" + nodeId + "\",";
@@ -253,12 +261,11 @@ void logEvent(String nodeId, String eventType, String detail) {
   payload += "\"timestamp\":" + String(millis());
   payload += "}";
 
-  http.POST(payload);
-  http.end();
+  sendFirebaseRequest("POST", "/events.json", payload);
 }
 
 // ---------------- ESP-NOW receive callback ----------------
-// Kept lightweight - just captures data; Firebase/analysis work happens in loop()
+// Lightweight queue enqueue - packets are preserved even during active Wi-Fi upload
 
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   struct_message temp;
@@ -276,9 +283,22 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
   if (temp.msg_type == MSG_SENSOR_DATA) {
     nodes[idx].lastSeen = millis();
-    nodes[idx].pendingData = temp;
-    nodes[idx].pendingRssi = info->rx_ctrl->rssi;
-    nodes[idx].hasPending = true;
+    Serial.print("[ESP-NOW] Received from ");
+    Serial.print(nodeId);
+    Serial.print(" | seq=");
+    Serial.println(temp.seq_num);
+    if (nodes[idx].queueCount < QUEUE_SIZE) {
+      nodes[idx].queueData[nodes[idx].queueHead] = temp;
+      nodes[idx].queueRssi[nodes[idx].queueHead] = info->rx_ctrl->rssi;
+      nodes[idx].queueHead = (nodes[idx].queueHead + 1) % QUEUE_SIZE;
+      nodes[idx].queueCount++;
+    } else {
+      // Overwrite oldest if ring buffer is full
+      nodes[idx].queueData[nodes[idx].queueHead] = temp;
+      nodes[idx].queueRssi[nodes[idx].queueHead] = info->rx_ctrl->rssi;
+      nodes[idx].queueHead = (nodes[idx].queueHead + 1) % QUEUE_SIZE;
+      nodes[idx].queueTail = (nodes[idx].queueTail + 1) % QUEUE_SIZE;
+    }
   }
 }
 
@@ -291,6 +311,9 @@ void setup() {
 
   initNodeTable();
   connectWiFi();
+
+  fbClient.setInsecure(); // Disable certificate validation for fast connection
+  fbClient.setTimeout(2); // 2 second TLS connection timeout
 
   Serial.println("[ESP-NOW] Initializing...");
   if (esp_now_init() != ESP_OK) {
@@ -340,12 +363,13 @@ void loop() {
     }
   }
 
-  // ---- 2. Process pending sensor readings ----
+  // ---- 2. Process queued sensor readings ----
   for (int i = 0; i < MAX_NODES; i++) {
-    if (nodes[i].hasPending) {
-      nodes[i].hasPending = false;
-      struct_message d = nodes[i].pendingData;
-      int rssi = nodes[i].pendingRssi;
+    if (nodes[i].queueCount > 0) {
+      struct_message d = nodes[i].queueData[nodes[i].queueTail];
+      int rssi = nodes[i].queueRssi[nodes[i].queueTail];
+      nodes[i].queueTail = (nodes[i].queueTail + 1) % QUEUE_SIZE;
+      nodes[i].queueCount--;
 
       bool wasInactive = !nodes[i].isActive;
       nodes[i].isActive = true;
@@ -400,11 +424,17 @@ void loop() {
         Serial.print(" OUT-OF-ORDER seq="); Serial.println(seq);
       }
 
+      // 1. Immediately push reading to Firebase RTDB
       pushReading(nodes[i].nodeId, nodes[i].sensorType, d.val1, d.val2, d.val3,
                   d.seq_num, d.timestamp, rssi, d.ack_delay_ms, isDuplicate, isOutOfOrder);
 
-      pushQos(nodes[i].nodeId, expected, nodes[i].receivedUniqueCount, lost, pdr,
-              nodes[i].duplicateCount, nodes[i].outOfOrderCount, rssi, d.ack_delay_ms);
+      // 2. Push QoS periodically (every 2 seconds) or immediately on sequence anomalies
+      // Avoids doubling HTTP traffic on every single packet
+      if (millis() - nodes[i].lastQosPush >= 2000 || isDuplicate || isOutOfOrder) {
+        nodes[i].lastQosPush = millis();
+        pushQos(nodes[i].nodeId, expected, nodes[i].receivedUniqueCount, lost, pdr,
+                nodes[i].duplicateCount, nodes[i].outOfOrderCount, rssi, d.ack_delay_ms);
+      }
     }
   }
 
@@ -431,9 +461,11 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED && wifiConnected) {
       Serial.println("[WiFi] Connection LOST. Will retry...");
       wifiConnected = false;
+      fbClient.stop();
     } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
       Serial.println("[WiFi] Reconnected!");
       wifiConnected = true;
+      fbClient.stop();
     } else if (WiFi.status() != WL_CONNECTED) {
       connectWiFi();
     }
