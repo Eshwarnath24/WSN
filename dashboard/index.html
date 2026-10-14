@@ -178,6 +178,202 @@
             <span class="nq-chip">N3: —</span>
           </div>
         </div>
+
+        <!-- Throughput (Defect 7 fix) -->
+        <div class="nq-card">
+          <div class="nq-card-label">Throughput</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value cyan" id="nq-throughput-val">—</span>
+            <span class="nq-card-unit">kbps</span>
+          </div>
+          <div class="nq-card-breakdown">
+            <span class="nq-chip">Live Rate: Sink RX</span>
+          </div>
+        </div>
+
+        <!-- Network Retransmissions (Defect 7 fix) -->
+        <div class="nq-card">
+          <div class="nq-card-label">Network Retries</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value amber" id="nq-retries-val">—</span>
+            <span class="nq-card-unit">pkts</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-retries-breakdown">
+            <span class="nq-chip">All Nodes Combined</span>
+          </div>
+        </div>
+
+        <!-- Duty Cycle (Defect 5 fix) -->
+        <div class="nq-card">
+          <div class="nq-card-label">Duty Cycle</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value green" id="nq-duty-val">—</span>
+            <span class="nq-card-unit">%</span>
+          </div>
+          <div class="nq-card-breakdown">
+            <span class="nq-chip">Active / Modem Sleep</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- EVALUATION DEMO CONTROLS -->
+    <section class="demo-controls" id="demo-controls">
+      <div class="dc-header">
+        <div class="dc-title-row">
+          <svg class="dc-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <h2 class="dc-title">Live Network Evaluation Controls</h2>
+          <span class="dc-subtitle">Interactive Mesh Test Suite</span>
+        </div>
+        <div class="dc-status" id="ctrl-last-action">Idle / Ready</div>
+      </div>
+      <div class="dc-btn-grid">
+        <button class="dc-btn dc-btn-amber" id="btn-collision">
+          <span class="btn-icon">⚡</span>
+          <span class="btn-label">Trigger CSMA/CA Contention</span>
+          <span class="btn-sub">Forces simultaneous broadcast to demo CCA & Binary Exponential Backoff</span>
+        </button>
+        <button class="dc-btn dc-btn-red" id="btn-kill">
+          <span class="btn-icon">✂</span>
+          <span class="btn-label">Simulate Link Failure (Kill N3↔N4)</span>
+          <span class="btn-sub">Breaks cluster link; triggers Cost-based reroute & N4 TDMA failover</span>
+        </button>
+        <button class="dc-btn dc-btn-green" id="btn-restore">
+          <span class="btn-icon">🔄</span>
+          <span class="btn-label">Restore Network Links</span>
+          <span class="btn-sub">Restores primary multi-hop tree and re-enables N3 aggregation</span>
+        </button>
+        <button class="dc-btn dc-btn-cyan" id="btn-query">
+          <span class="btn-icon">📊</span>
+          <span class="btn-label">Query Network State</span>
+          <span class="btn-sub">Polls mesh neighbors, MAC statistics, and routing table</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ADVANCED MESH INTELLIGENCE: TOPOLOGY, AGGREGATION & BLE LOCALIZATION -->
+    <section class="mesh-intel-grid">
+      <!-- 1. MESH TOPOLOGY & ROUTING -->
+      <div class="mi-card">
+        <div class="mi-header">
+          <span class="mi-title">Mesh Routing Topology</span>
+          <span class="nq-chip" id="topo-status-chip">Clustered Multi-Hop</span>
+        </div>
+        <div class="topo-canvas" id="topo-canvas-container">
+          <svg width="100%" height="100%" viewBox="0 0 320 200" id="topo-svg">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#00d2ff"/>
+              </marker>
+              <marker id="arrow-dashed" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#facc15"/>
+              </marker>
+            </defs>
+            <!-- Link lines (dynamically colored) -->
+            <line id="link-n1-n3" x1="60" y1="50" x2="160" y2="100" stroke="#00d2ff" stroke-width="2" stroke-dasharray="none" marker-end="url(#arrow)"/>
+            <line id="link-n2-n3" x1="60" y1="150" x2="160" y2="100" stroke="#00d2ff" stroke-width="2" stroke-dasharray="none" marker-end="url(#arrow)"/>
+            <line id="link-n3-n4" x1="160" y1="100" x2="260" y2="100" stroke="#00d2ff" stroke-width="2.5" marker-end="url(#arrow)"/>
+            <line id="link-n1-n4" x1="60" y1="50" x2="260" y2="100" stroke="rgba(255,255,255,0.08)" stroke-width="1.5" stroke-dasharray="4,4"/>
+            <line id="link-n2-n4" x1="60" y1="150" x2="260" y2="100" stroke="rgba(255,255,255,0.08)" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+            <!-- Node Circles -->
+            <g transform="translate(60, 50)">
+              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2"/>
+              <text text-anchor="middle" dy="4" fill="#fff" font-size="10" font-weight="700" font-family="'JetBrains Mono'">N1</text>
+            </g>
+            <g transform="translate(60, 150)">
+              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2"/>
+              <text text-anchor="middle" dy="4" fill="#fff" font-size="10" font-weight="700" font-family="'JetBrains Mono'">N2</text>
+            </g>
+            <g transform="translate(160, 100)">
+              <circle r="18" fill="#090e1a" stroke="#c084fc" stroke-width="2.5" id="node-n3-circle"/>
+              <text text-anchor="middle" dy="4" fill="#fff" font-size="11" font-weight="700" font-family="'JetBrains Mono'">N3</text>
+            </g>
+            <g transform="translate(260, 100)">
+              <circle r="20" fill="#090e1a" stroke="#22c55e" stroke-width="2.5"/>
+              <text text-anchor="middle" dy="4" fill="#fff" font-size="11" font-weight="700" font-family="'JetBrains Mono'">N4</text>
+            </g>
+          </svg>
+        </div>
+        <div class="topo-list" id="topo-list">
+          <div class="topo-row">
+            <span class="topo-route">N1 (Vibration) → <span id="n1-next-hop">N3</span></span>
+            <span class="topo-badge badge-alive" id="n1-link-badge">ALIVE</span>
+          </div>
+          <div class="topo-row">
+            <span class="topo-route">N2 (Flame/Relay) → <span id="n2-next-hop">N3</span></span>
+            <span class="topo-badge badge-alive" id="n2-link-badge">ALIVE</span>
+          </div>
+          <div class="topo-row">
+            <span class="topo-route">N3 (Cluster Head) → <span id="n3-next-hop">N4</span></span>
+            <span class="topo-badge badge-alive" id="n3-link-badge">ALIVE</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. CLUSTER HEAD DATA AGGREGATION -->
+      <div class="mi-card">
+        <div class="mi-header">
+          <span class="mi-title">N3 Cluster Aggregation</span>
+          <span class="nq-chip" id="agg-hops-chip">1 Hop to Sink</span>
+        </div>
+        <div class="agg-reduction-banner">
+          <div class="agg-val-huge" id="agg-reduction-val">0.0%</div>
+          <div class="agg-val-sub">Payload Bandwidth Reduction</div>
+          <div class="agg-meter-bg">
+            <div class="agg-meter-fill" id="agg-meter-fill"></div>
+          </div>
+        </div>
+        <div class="agg-detail-grid">
+          <div class="agg-box">
+            <div class="agg-box-label">Raw Ingress</div>
+            <div class="agg-box-val" id="agg-bytes-in">— B</div>
+          </div>
+          <div class="agg-box">
+            <div class="agg-box-label">Agg Egress</div>
+            <div class="agg-box-val" id="agg-bytes-out">— B</div>
+          </div>
+          <div class="agg-box">
+            <div class="agg-box-label">N1 Mean Accel</div>
+            <div class="agg-box-val" id="agg-n1-summary">—</div>
+          </div>
+          <div class="agg-box">
+            <div class="agg-box-label">N2 Flame Peak</div>
+            <div class="agg-box-val" id="agg-n2-summary">—</div>
+          </div>
+        </div>
+        <div class="topo-row" style="margin-top: 10px;">
+          <span class="topo-route">IR Obstacle Status:</span>
+          <span class="topo-badge badge-alive" id="agg-ir-badge">CLEAR</span>
+        </div>
+      </div>
+
+      <!-- 3. BLE REAL-TIME 2D LOCALIZATION -->
+      <div class="mi-card">
+        <div class="mi-header">
+          <span class="mi-title">BLE Trilateration Engine</span>
+          <span class="nq-chip" id="ble-anchors-chip">3 Anchors Active</span>
+        </div>
+        <div class="ble-canvas-wrapper">
+          <canvas id="ble-map-canvas"></canvas>
+        </div>
+        <div class="ble-table" id="ble-table">
+          <div class="ble-table-row">
+            <span>N1 (Vibration):</span>
+            <span class="val" id="ble-n1-pos">est=(—, —) err=—m</span>
+          </div>
+          <div class="ble-table-row">
+            <span>N2 (Flame):</span>
+            <span class="val" id="ble-n2-pos">est=(—, —) err=—m</span>
+          </div>
+          <div class="ble-table-row">
+            <span>N3 (Cluster):</span>
+            <span class="val" id="ble-n3-pos">est=(—, —) err=—m</span>
+          </div>
+        </div>
       </div>
     </section>
 
