@@ -267,6 +267,7 @@ void loop() {
 
   // 2. BLE
   ble_tick();
+  ble_serial_poll();   // Serial Monitor: status | ble | cal <id> <m> | setn <n>
   if (now - lastBleReport >= BLE_REPORT_PERIOD_MS && !mesh_own_tx_busy(OWN_TX_BLE)) {
     lastBleReport = now;
     ble_report_payload_t rpt = ble_build_report();

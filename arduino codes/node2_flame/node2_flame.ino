@@ -82,6 +82,7 @@ void loop() {
 
   // 3. BLE scan burst in SLEEP epoch
   ble_tick();
+  ble_serial_poll();   // Serial Monitor: status | ble | cal <id> <m> | setn <n>
 
   // 4. BLE report every 10 s (CAP)
   if (now - lastBleReport >= BLE_REPORT_PERIOD_MS && !mesh_own_tx_busy(OWN_TX_BLE)) {
