@@ -15,7 +15,6 @@
 // ====================================================================
 
 #define MY_NODE_ID 4
-#pragma GCC optimize("Os")   // shrink binary; safe on ESP32 (no timing-critical ISRs here)
 #if __has_include("wsn_common.h")
 #include "wsn_common.h"
 #include "wsn_mesh.h"
@@ -28,6 +27,7 @@
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <time.h>
 
 // Wi-Fi / Firebase credentials live in wsn_config.h (keep it out of Git).
 #if __has_include("wsn_config.h")
@@ -41,18 +41,18 @@ const char* WIFI_PASS     = WSN_WIFI_PASS;
 const char* FIREBASE_HOST = WSN_FIREBASE_HOST;
 
 #define WIFI_TIMEOUT_ATTEMPTS 20
-#define FIREBASE_QUEUE_SIZE   5       // keep small: each entry holds FB_PAYLOAD_SIZE bytes of heap
-#define FB_PAYLOAD_SIZE       1536    // 5x1536=7.5KB queue RAM vs 8x2048=16KB — saves ~8KB heap
-#define FB_BATCH_SIZE         1500    // rolling batch buffer
-#define FB_FLUSH_PERIOD_MS    3000    // one HTTPS request every 3 s (TLS handshake takes 1-3 s)
+#define FIREBASE_QUEUE_SIZE   3       // batches waiting for upload
+#define FB_PAYLOAD_SIZE       3700    // one batched multi-path PATCH
+#define FB_BATCH_SIZE         3600
+#define FB_FLUSH_PERIOD_MS    2000    // one HTTPS request every 2 s instead of ~4 per second
 #define NODE_ACTIVE_TIMEOUT_MS 8000
 #define N3_SILENT_MS          10000
-#define METRICS_PERIOD_MS     10000  // push performance metrics every 10 s (was 5 s, too frequent)
-#define DATA_PUSH_MIN_MS      2000   // min 2 s between per-node Firebase pushes (was 1 s)
+#define METRICS_PERIOD_MS     5000
+#define DATA_PUSH_MIN_MS      1000
 
 // ==================== FIREBASE CLIENT ====================
-WiFiClientSecure fbClient;   // TLS required for firebasedatabase.app (HTTPS-only)
-HTTPClient       fbHttp;
+WiFiClientSecure fbClient;
+HTTPClient fbHttp;
 volatile bool wifiConnected = false;
 
 // ==================== REMOTE DASHBOARD COMMANDS ====================
@@ -98,6 +98,10 @@ uint32_t last_metrics_ms = 0;
 uint32_t agg_bytes_in_total = 0, agg_bytes_out_total = 0;
 uint32_t agg_pkts_in_total = 0, agg_pkts_out_total = 0;
 float    loc_error[NUM_NODES + 1] = { -1, -1, -1, -1, -1 };
+float    loc_x[NUM_NODES + 1], loc_y[NUM_NODES + 1];
+struct { float pdr, loss, delay, kbps, red_b, red_p, loc; uint32_t rx, exp, retx; } last_perf = {0};
+volatile uint32_t fb_ok = 0, fb_fail = 0;
+volatile int fb_last_code = 0;
 
 // Node liveness for dashboard status
 uint32_t last_activity_ms[NUM_NODES + 1] = {0};
@@ -112,33 +116,199 @@ uint16_t failoverCount = 0;
 uint32_t lastStatusPrint = 0;
 uint32_t lastBleReport = 0;
 uint32_t lastPerfPush = 0;
-uint32_t lastWifiCheck = 0;
 uint32_t lastWatchdog = 0;
 uint32_t lastFailoverCheck = 0;
 
 // ==================== FIREBASE HELPERS ====================
 
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; return; }
-  // Reset any stuck connecting state — this prevents:
-  // "E: wifi:sta is connecting, cannot set config"
-  WiFi.disconnect(true);          // drop current connection attempt
-  delay(100);                     // let driver settle
-  WiFi.mode(WIFI_STA);
-  Serial.printf_P(PSTR("[WiFi] Connecting to %s ...\n"), WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < WIFI_TIMEOUT_ATTEMPTS) {
-    delay(500); Serial.print('.'); attempts++;
+// ---------- Wi-Fi (channel-pinned, never leaves the mesh channel) ----------
+// The hotspot's channel IS the ESP-NOW mesh channel. The Arduino default
+// auto-reconnect scans all 13 channels: while it scans N4 is off the mesh
+// channel, so every unicast to N4 fails ("Link-layer send failed", ACK
+// timeouts, links DEAD). The hardware log showed exactly this, plus
+// "sta is connecting, cannot set config" from calling begin() again while
+// the previous attempt was still running. Here:
+//   - auto-reconnect is OFF; we reconnect ourselves from cloudTask,
+//     non-blocking, every WIFI_RETRY_MS, pinned to the saved channel + BSSID
+//     (the driver then scans only the mesh channel);
+//   - a full 13-channel scan happens only if N4 never found the hotspot,
+//     or after 4 failed pinned attempts (hotspot restarted on a new channel),
+//     at most every WIFI_SCAN_RETRY_MS;
+//   - WiFi.disconnect(false) (radio stays ON) before each attempt so the
+//     driver is never "already connecting".
+#define WIFI_BOOT_TIMEOUT_MS  15000
+#define WIFI_RETRY_MS         15000
+#define WIFI_SCAN_RETRY_MS    60000
+#define MESH_DEFAULT_CHANNEL  1     // used only if the hotspot is not visible at boot
+
+static uint8_t  wifi_ch = 0;
+static uint8_t  wifi_bssid[6];
+static bool     wifi_have_ap = false;      // channel + BSSID known
+static uint32_t wifi_last_try = 0;
+static uint32_t wifi_last_scan_try = 0;
+static uint32_t wifi_lost_ms = 0;
+static uint16_t wifi_attempts = 0;         // attempts since the link was lost
+static uint32_t wifi_reconnects = 0;
+static volatile uint8_t wifi_last_reason = 0;
+static volatile bool    wifi_self_disc = false;  // our own disconnect(), not a real drop
+
+const char* wifiReasonStr(uint8_t r) {
+  switch (r) {
+    case 0:   return "none";
+    case 2:   return "auth expired";
+    case 3:   return "AP deauthenticated N4";
+    case 4:   return "inactivity (AP dropped idle client)";
+    case 8:   return "left";
+    case 15:  return "4-way handshake timeout (wrong password?)";
+    case 200: return "beacon timeout (weak signal / radio busy)";
+    case 201: return "hotspot not found (off, 5 GHz, or out of range)";
+    case 202: return "authentication failed (wrong password?)";
+    case 203: return "association failed";
+    case 204: return "handshake timeout (wrong password?)";
+    case 205: return "connection failed";
+    default:  return "see ESP-IDF wifi_err_reason_t";
   }
+}
+
+const char* wifiStatusStr(int st) {
+  switch (st) {
+    case WL_CONNECTED:      return "connected";
+    case WL_NO_SSID_AVAIL:  return "hotspot not found";
+    case WL_CONNECT_FAILED: return "connect failed";
+    case WL_CONNECTION_LOST:return "connection lost";
+    case WL_DISCONNECTED:   return "disconnected";
+    case WL_IDLE_STATUS:    return "idle";
+    default:                return "?";
+  }
+}
+
+void wifiOnEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    if (wifi_self_disc) { wifi_self_disc = false; return; }
+    wifi_last_reason = info.wifi_sta_disconnected.reason;
+  }
+}
+
+void wifiSaveAp() {
+  wifi_ch = (uint8_t)WiFi.channel();
+  const uint8_t* b = WiFi.BSSID();
+  if (b) memcpy(wifi_bssid, b, 6);
+  wifi_have_ap = (wifi_ch >= 1 && wifi_ch <= 13 && b != nullptr);
+}
+
+// Put the radio back on the mesh channel after a failed attempt/scan.
+void wifiHoldMeshChannel() {
+  uint8_t ch = wifi_ch ? wifi_ch : MESH_DEFAULT_CHANNEL;
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+}
+
+// Boot only (blocking is fine here: the mesh is not running yet).
+void connectWiFi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.onEvent(wifiOnEvent);
+
+  // 1. One scan to find the hotspot's channel and BSSID (strongest AP with that name)
+  Serial.printf("[WiFi] Scanning for hotspot \"%s\" ...\n", WIFI_SSID);
+  int n = WiFi.scanNetworks();
+  int best = -1;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID && (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best))) best = i;
+  }
+  if (best >= 0) {
+    wifi_ch = (uint8_t)WiFi.channel(best);
+    memcpy(wifi_bssid, WiFi.BSSID(best), 6);
+    wifi_have_ap = true;
+    Serial.printf("[WiFi] Found \"%s\" on channel %d, RSSI %d dBm\n", WIFI_SSID, wifi_ch, (int)WiFi.RSSI(best));
+  } else {
+    Serial.printf("[WiFi] Hotspot \"%s\" NOT visible (%d networks seen", WIFI_SSID, n < 0 ? 0 : n);
+    for (int i = 0; i < n && i < 6; i++) Serial.printf("%s\"%s\" ch%d", i ? ", " : ": ", WiFi.SSID(i).c_str(), (int)WiFi.channel(i));
+    Serial.println(")");
+    Serial.println("[WiFi] Check: hotspot ON, 2.4 GHz band (ESP32 has no 5 GHz), exact name in wsn_config.h, phone < 5 m away");
+  }
+  WiFi.scanDelete();
+
+  // 2. Connect (pinned to the channel/BSSID when known)
+  Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
+  if (wifi_have_ap) WiFi.begin(WIFI_SSID, WIFI_PASS, wifi_ch, wifi_bssid);
+  else              WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_BOOT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  wifi_last_try = millis();
+  wifi_last_scan_try = millis();
+
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    Serial.printf_P(PSTR("\n[WiFi] CONNECTED IP=%s ch=%d\n"),
-                    WiFi.localIP().toString().c_str(), WiFi.channel());
+    wifiSaveAp();
+    Serial.printf("\n[WiFi] CONNECTED | IP=%s | RSSI %d dBm | Channel=%d (ESP-NOW mesh uses this channel)\n",
+                  WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), wifi_ch);
   } else {
     wifiConnected = false;
-    WiFi.disconnect(true);        // leave driver idle, not stuck-connecting
-    Serial.printf_P(PSTR("\n[WiFi] FAILED(%d) — mesh OK, retry in 30 s\n"), WiFi.status());
+    Serial.printf("\n[WiFi] Not connected yet (%s, reason %u: %s). The mesh works without Wi-Fi;\n"
+                  "       N4 retries in the background (every %d s, on the mesh channel only) and uploads once connected.\n",
+                  wifiStatusStr(WiFi.status()), (unsigned)wifi_last_reason, wifiReasonStr(wifi_last_reason),
+                  WIFI_RETRY_MS / 1000);
+    wifi_self_disc = true;
+    WiFi.disconnect(false);   // stop the attempt, radio stays ON
+    wifiHoldMeshChannel();
+  }
+}
+
+void drainFirebaseQueue() {
+  static firebase_msg_t junk;
+  while (xQueueReceive(firebaseQueue, &junk, 0) == pdTRUE) {}
+}
+
+// cloudTask (core 0), called every loop: never blocks.
+void wifiMaintain() {
+  uint32_t now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      uint8_t old_ch = wifi_ch;
+      wifiSaveAp();
+      wifi_reconnects++;
+      fbClient.stop();
+      wifiConnected = true;
+      LOGE("[WiFi] CONNECTED again after %lu s (attempt %u) | RSSI %d dBm | channel %d\n",
+           (unsigned long)(wsn_age_ms(wifi_lost_ms) / 1000), wifi_attempts, (int)WiFi.RSSI(), wifi_ch);
+      if (old_ch && old_ch != wifi_ch)
+        LOGE("[WiFi] Hotspot moved to channel %d (was %d) — N1–N3 re-sync to it automatically\n", wifi_ch, old_ch);
+      wifi_attempts = 0;
+    }
+    return;
+  }
+  if (wifiConnected) {
+    wifiConnected = false;
+    wifi_lost_ms = now;
+    wifi_attempts = 0;
+    wifi_last_try = now - WIFI_RETRY_MS + 2000;   // first retry 2 s after the drop
+    fbClient.stop();
+    drainFirebaseQueue();
+    LOGE("[WiFi] Connection LOST (reason %u: %s) — mesh keeps running on channel %d, retrying\n",
+         (unsigned)wifi_last_reason, wifiReasonStr(wifi_last_reason), wifi_ch);
+  }
+  if (now - wifi_last_try < WIFI_RETRY_MS) return;
+
+  // Pinned attempt; a full scan only if the AP is unknown or pinned attempts keep failing
+  bool full_scan = !wifi_have_ap || (wifi_attempts >= 4 && wifi_attempts % 4 == 0);
+  if (full_scan && now - wifi_last_scan_try < WIFI_SCAN_RETRY_MS) full_scan = false;
+  if (!wifi_have_ap && !full_scan) return;
+  wifi_last_try = now;
+  wifi_attempts++;
+  wifi_self_disc = true;
+  WiFi.disconnect(false);          // finish any previous attempt; radio stays ON
+  if (full_scan) {
+    wifi_last_scan_try = now;
+    LOGE("[WiFi] Retry %u: full channel scan for \"%s\" (mesh may pause ~2 s)\n", wifi_attempts, WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  } else {
+    LOGE("[WiFi] Retry %u: reconnecting on channel %d (last reason %u: %s)\n",
+         wifi_attempts, wifi_ch, (unsigned)wifi_last_reason, wifiReasonStr(wifi_last_reason));
+    WiFi.begin(WIFI_SSID, WIFI_PASS, wifi_ch, wifi_bssid);
   }
 }
 
@@ -150,12 +320,17 @@ void connectWiFi() {
 static char fb_batch[FB_BATCH_SIZE];
 static int  fb_batch_len = 0;
 static uint32_t fb_dropped = 0;
+static uint32_t fb_offline = 0;   // batches not sent because Wi-Fi was down
 
 void fb_key(char* out, size_t n) {
-  // millis()-based key with counter: unique within a session, no NTP needed
   static uint8_t ctr = 0;
+  time_t t = time(nullptr);
   ctr = (ctr + 1) % 100;
-  snprintf(out, n, "m%010lu%02u", (unsigned long)millis(), ctr);
+  if (t > 1700000000) {
+    snprintf(out, n, "t%010lu%03u%02u", (unsigned long)t, (unsigned)(millis() % 1000), ctr);
+  } else {
+    snprintf(out, n, "m%010lu%02u", (unsigned long)millis(), ctr);  // before NTP sync
+  }
 }
 
 void fb_flush() {
@@ -164,10 +339,16 @@ void fb_flush() {
   strcpy(msg.method, "PATCH");
   strcpy(msg.path, "/.json");
   snprintf(msg.payload, sizeof(msg.payload), "{%s}", fb_batch);
-  if (xQueueSend(firebaseQueue, &msg, 0) != pdTRUE) {
+  if (!wifiConnected) {
+    fb_offline++;                // no Wi-Fi: nothing to upload to (counted in the CLOUD line)
+  } else if (xQueueSend(firebaseQueue, &msg, 0) != pdTRUE) {
     fb_dropped++;
-    Serial.printf_P(PSTR("[Firebase] busy—batch %dB skipped (dropped=%lu)\n"),
+    static uint32_t last_busy_log = 0;
+    if (millis() - last_busy_log > 10000) {   // rate-limited
+      last_busy_log = millis();
+      Serial.printf("[Firebase] Upload still busy — batch of %d B skipped (total skipped %lu)\n",
                     fb_batch_len, (unsigned long)fb_dropped);
+    }
   }
   fb_batch_len = 0;
   fb_batch[0] = '\0';
@@ -224,25 +405,27 @@ void queueFirebase(const char* method, const char* path, const char* payload) {
   fb_append(rel, payload);
 }
 
-// Execute a Firebase HTTPS request (called from cloudTask)
+// Execute a Firebase HTTP request (called from cloudTask)
 bool executeFirebase(const firebase_msg_t& msg) {
   if (!wifiConnected || WiFi.status() != WL_CONNECTED) return false;
   String url = String(FIREBASE_HOST) + msg.path;
   for (int attempt = 0; attempt < 2; attempt++) {
     fbHttp.begin(fbClient, url);
     fbHttp.setReuse(true);
-    fbHttp.setTimeout(5000);  // TLS handshake can take 1-3 s on ESP32
+    fbHttp.setTimeout(5000);   // TLS handshake on ESP32 can take 1–3 s
     fbHttp.addHeader("Content-Type", "application/json");
     int code = 0;
     if (strcmp(msg.method, "POST") == 0)       code = fbHttp.POST(msg.payload);
     else if (strcmp(msg.method, "PATCH") == 0) code = fbHttp.PATCH(msg.payload);
     else                                       code = fbHttp.PUT(msg.payload);
     fbHttp.end();
-    if (code > 0 && code < 400) return true;
-    Serial.printf_P(PSTR("[Cloud] HTTP %s %s code=%d heap=%u\n"),
-                    msg.method, msg.path, code, (unsigned)ESP.getFreeHeap());
+    fb_last_code = code;
+    if (code > 0 && code < 400) { fb_ok++; return true; }
+    Serial.printf("[Cloud] HTTP %s %s → code %d (%s), free heap %u B, payload %u B\n",
+                  msg.method, msg.path, code, code < 0 ? "connection/TLS error" : "server rejected",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)strlen(msg.payload));
     fbClient.stop();
-    if (attempt == 0) delay(300);
+    if (attempt == 0) delay(200);
   }
   return false;
 }
@@ -336,10 +519,10 @@ void processSensorData(const wsn_packet_t& pkt, int rssi) {
   note_delivered_bytes(pkt);
 
   bool colltest = strncmp(sp.sensor_type, "colltest", sizeof(sp.sensor_type)) == 0;
-  Serial.printf_P(PSTR("[SINK] DATA N%d v1=%.2f v2=%.2f v3=%.2f t=%s seq=%d hops=%d rt=%s dly=%ldms RSSI=%d\n"),
+  LOGV("[SINK] DATA from N%d: v1=%.2f v2=%.2f v3=%.2f sensor=%s seq=%d hops=%d route=%s delay=%ld ms RSSI(last hop)=%d\n",
     oid, sp.val1, sp.val2, sp.val3, sp.sensor_type, pkt.seq_num, pkt.hop_count, route, (long)delay, rssi);
   if (colltest) {
-    Serial.println(F("[SINK] Collision-test frame delivered"));
+    LOGV("[SINK] Collision-test frame delivered (counted for PDR, excluded from sensor charts)\n");
     return;
   }
   push_node_data(oid, sp.sensor_type, pkt.seq_num, sp.val1, sp.val2, sp.val3,
@@ -381,26 +564,30 @@ void processAggData(const wsn_packet_t& pkt, int rssi) {
   portEXIT_CRITICAL(&sink_mux);
   float win_red = ap.win_bytes_in ? (1.0f - (float)ap.win_bytes_out / ap.win_bytes_in) * 100.0f : 0;
 
-  Serial.printf_P(PSTR("[SINK] AGG N%d seq=%d via %s: N1[%d](%.2f,%.2f,%.2f)max=%.2f N2[%d]fl=%.0f/%d N3IR=%d\n"),
+  LOGV("[SINK] AGG from N%d seq=%d route=%s: N1[%d] mean=(%.2f,%.2f,%.2f) max=%.2f | N2[%d] flame max=%.0f min=%.0f DO=%d | N3 IR=%d\n",
     pkt.origin_id, pkt.seq_num, route, ap.n1_count, ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z,
-    ap.n1_accel_max, ap.n2_count, ap.n2_flame_analog_max, ap.n2_flame_digital, ap.n3_ir_obstacle);
-  Serial.printf_P(PSTR("[SINK] AGG red: %uB→%uB(%.1f%%) cum=%.1f%% pkts %lu→%lu(%.1f%%) dly N3=%ldms N1=%ldms N2=%ldms\n"),
+    ap.n1_accel_max, ap.n2_count, ap.n2_flame_analog_max, ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n3_ir_obstacle);
+  LOGV("[SINK] AGG reduction: window %u B→%u B (%.1f%%) | cumulative bytes %.1f%%, packets %lu→%lu (%.1f%%) | delay N3=%ld ms, N1(oldest)=%ld ms, N2(oldest)=%ld ms (-1 = no reading)\n",
     ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red,
     (unsigned long)agg_pkts_in_total, (unsigned long)agg_pkts_out_total, pkt_red, (long)d3, (long)d1, (long)d2);
 
-  // Dashboard: aggregation card (compact payload to save flash)
+  // Dashboard: aggregation card
   static uint32_t lastAggPush = 0;
   if (millis() - lastAggPush >= DATA_PUSH_MIN_MS) {
     lastAggPush = millis();
-    char payload[512];
+    char payload[FB_PAYLOAD_SIZE];
     snprintf(payload, sizeof(payload),
-      "{\"n1x\":%.2f,\"n1y\":%.2f,\"n1z\":%.2f,\"n1max\":%.2f,\"n1c\":%u,"
-      "\"n2max\":%.0f,\"n2min\":%.0f,\"n2d\":%u,\"n2c\":%u,\"n3ir\":%u,"
-      "\"bin\":%u,\"bout\":%u,\"red\":%.1f,\"cred\":%.1f,\"pred\":%.1f,"
-      "\"hops\":%u,\"rt\":\"%s\",\"ts\":%lu}",
+      "{\"n1_mean_x\":%.2f,\"n1_mean_y\":%.2f,\"n1_mean_z\":%.2f,\"n1_max\":%.2f,\"n1_count\":%u,"
+      "\"n2_flame_max\":%.0f,\"n2_flame_min\":%.0f,\"n2_flame_digital\":%u,\"n2_count\":%u,\"n3_ir\":%u,"
+      "\"n1_seq\":\"%u-%u\",\"n2_seq\":\"%u-%u\","
+      "\"bytes_in\":%u,\"bytes_out\":%u,\"reduction_pct\":%.1f,"
+      "\"cum_reduction_pct\":%.1f,\"pkt_reduction_pct\":%.1f,\"pkts_in\":%lu,\"pkts_out\":%lu,"
+      "\"hops\":%u,\"route\":\"%s\",\"timestamp\":%lu}",
       ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z, ap.n1_accel_max, ap.n1_count,
       ap.n2_flame_analog_max, ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n2_count, ap.n3_ir_obstacle,
+      ap.n1_seq_start, ap.n1_seq_end, ap.n2_seq_start, ap.n2_seq_end,
       ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red, pkt_red,
+      (unsigned long)agg_pkts_in_total, (unsigned long)agg_pkts_out_total,
       pkt.hop_count + 1, route, (unsigned long)millis());
     queueFirebase("POST", "/agg/data.json", payload);
   }
@@ -448,30 +635,36 @@ void localizeReport(const ble_report_payload_t& rpt) {
   float ex = 0, ey = 0, err = -1, rms = 0;
   bool ok = ble_localize(id, ids, dists, rpt.num_neighbors, ex, ey, err, &rms);
   for (int i = 0; i < rpt.num_neighbors && i < 3; i++) {
-    Serial.printf("[SINK]   N%d sees N%d: RSSI=%d dBm → %.2f m\n", id, ids[i], rpt.entries[i].rssi, dists[i]);
+    LOGV("[SINK]   N%d sees N%d: RSSI=%d dBm → %.2f m\n", id, ids[i], rpt.entries[i].rssi, dists[i]);
   }
   if (ok) {
     loc_error[id] = err;
-    Serial.printf("[SINK] Localization N%d: est=(%.2f,%.2f) true=(%.2f,%.2f) error=%.2f m | residual=%.2f m (%s) | nearest=N%d\n",
+    loc_x[id] = ex;
+    loc_y[id] = ey;
+    LOGE("[SINK] Localization N%d: est=(%.2f,%.2f) reference=(%.2f,%.2f) error=%.2f m | range residual %.2f m (%s) | nearest=N%d\n",
                   id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rms,
-                  rms < 1.0f ? "good" : (rms < 3.0f ? "fair" : "poor: calibrate TxPower"), rpt.nearest_node_id);
-  } else if (rpt.num_neighbors == 2) {
-    // 2-anchor fallback: weighted midpoint along the line between the two anchors
-    // weight_i = 1/d_i^2 (closer anchor counts more)
-    float w0 = (dists[0] > 0.01f) ? 1.0f / (dists[0] * dists[0]) : 100.0f;
-    float w1 = (dists[1] > 0.01f) ? 1.0f / (dists[1] * dists[1]) : 100.0f;
-    float wt = w0 + w1;
-    ex = (w1 * NODE_TRUE_POS[ids[0]][0] + w0 * NODE_TRUE_POS[ids[1]][0]) / wt;
-    ey = (w1 * NODE_TRUE_POS[ids[0]][1] + w0 * NODE_TRUE_POS[ids[1]][1]) / wt;
-    err = sqrtf(powf(ex - NODE_TRUE_POS[id][0], 2) + powf(ey - NODE_TRUE_POS[id][1], 2));
+                  rms < 1.0f ? "good" : (rms < 3.0f ? "fair" : "poor: calibrate"), rpt.nearest_node_id);
+  } else if (rpt.num_neighbors == 2 && ids[0] && ids[1]) {
+    // Only 2 BLE neighbours (the hardware test often had one weak link):
+    // weighted-proximity estimate between the two anchors, the closer one
+    // weighing more (w = 1/d^2). Coarser than 3-anchor trilateration.
+    float w0 = 1.0f / (dists[0] * dists[0] + 0.01f);
+    float w1 = 1.0f / (dists[1] * dists[1] + 0.01f);
+    ex = (w0 * NODE_TRUE_POS[ids[0]][0] + w1 * NODE_TRUE_POS[ids[1]][0]) / (w0 + w1);
+    ey = (w0 * NODE_TRUE_POS[ids[0]][1] + w1 * NODE_TRUE_POS[ids[1]][1]) / (w0 + w1);
+    float dx = ex - NODE_TRUE_POS[id][0], dy = ey - NODE_TRUE_POS[id][1];
+    err = sqrtf(dx * dx + dy * dy);
+    ok = true;
     loc_error[id] = err;
-    Serial.printf("[SINK] Localization N%d: 2-anchor weighted-proximity est=(%.2f,%.2f) true=(%.2f,%.2f) error=%.2f m | nearest=N%d (need 3 anchors for full trilateration)\n",
-                  id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rpt.nearest_node_id);
+    loc_x[id] = ex;
+    loc_y[id] = ey;
+    LOGE("[SINK] Localization N%d: 2-anchor estimate (N%d, N%d) est=(%.2f,%.2f) reference=(%.2f,%.2f) error=%.2f m | nearest=N%d (3 anchors give full trilateration)\n",
+         id, ids[0], ids[1], ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rpt.nearest_node_id);
   } else {
-    Serial.printf("[SINK] Localization N%d: only %d anchor(s) visible — nearest=N%d (need ≥2 for estimate, 3 for trilateration)\n",
+    LOGE("[SINK] Localization N%d: proximity only (%d anchors) | nearest=N%d\n",
                   id, rpt.num_neighbors, rpt.nearest_node_id);
   }
-  pushLocalization(id, rpt, ok || rpt.num_neighbors == 2, ex, ey, err);
+  pushLocalization(id, rpt, ok, ex, ey, err);
 }
 
 void processBleReport(const wsn_packet_t& pkt) {
@@ -479,7 +672,7 @@ void processBleReport(const wsn_packet_t& pkt) {
   getPayload(pkt, rpt);
   char route[32];
   build_route(pkt, route, sizeof(route));
-  Serial.printf("[SINK] BLE Report from N%d via %s: %d neighbours\n", rpt.reporter_id, route, rpt.num_neighbors);
+  LOGV("[SINK] BLE Report from N%d via %s: %d neighbours\n", rpt.reporter_id, route, rpt.num_neighbors);
   last_activity_ms[pkt.origin_id] = millis();
   localizeReport(rpt);
 }
@@ -516,6 +709,39 @@ void app_on_ctrl(ctrl_cmd_t cmd, uint8_t p1, uint8_t p2) {}
 
 bool app_on_data_transit(const wsn_packet_t& pkt, int rssi) {
   return false;
+}
+
+// ==================== 5 s SUMMARY LINES ====================
+void app_summary() {
+  Serial.print(" SINK  :");
+  for (int i = 1; i <= 3; i++) {
+    origin_stats_t& os = origin_stats[i];
+    if (!os.ever_seen) { Serial.printf(" N%d no data yet |", i); continue; }
+    uint32_t expected = (uint32_t)(os.highest_seq - os.first_seq) + 1;
+    uint32_t rx = (os.unique_rx > expected) ? expected : os.unique_rx;
+    float avg_delay = os.delay_samples ? (float)os.total_delay_ms / os.delay_samples : 0;
+    Serial.printf(" N%d %lu/%lu PDR %.1f%% delay %.0f ms via %s |", i, (unsigned long)rx, (unsigned long)expected,
+                  expected ? rx * 100.0f / expected : 0.0f, avg_delay, os.last_path);
+  }
+  Serial.println();
+  Serial.printf(" PERF  : PDR %.1f%% (%lu/%lu) | loss %.1f%% | avg end-to-end delay %.0f ms | throughput %.3f kbps | retransmissions %lu | data reduction %.1f%% bytes, %.1f%% packets\n",
+                last_perf.pdr, (unsigned long)last_perf.rx, (unsigned long)last_perf.exp, last_perf.loss, last_perf.delay,
+                last_perf.kbps, (unsigned long)last_perf.retx, last_perf.red_b, last_perf.red_p);
+  Serial.print(" LOCAL :");
+  for (int i = 1; i <= NUM_NODES; i++) {
+    if (loc_error[i] >= 0) Serial.printf(" N%d at (%.2f, %.2f) err %.2f m |", i, loc_x[i], loc_y[i], loc_error[i]);
+    else                   Serial.printf(" N%d not localized yet |", i);
+  }
+  Serial.println();
+  if (wifiConnected)
+    Serial.printf(" CLOUD : Wi-Fi connected (ch %d, RSSI %d dBm, reconnects %lu) | Firebase uploads ok %lu, failed %lu (last HTTP code %d) | batches skipped %lu | free heap %u B\n",
+                  wifi_ch, (int)WiFi.RSSI(), (unsigned long)wifi_reconnects, (unsigned long)fb_ok, (unsigned long)fb_fail,
+                  fb_last_code, (unsigned long)fb_dropped, (unsigned)ESP.getFreeHeap());
+  else
+    Serial.printf(" CLOUD : Wi-Fi DOWN for %lu s (%s, last reason %u: %s; retry %u, mesh unaffected) | uploads ok %lu, not sent while down %lu | free heap %u B\n",
+                  (unsigned long)(wsn_age_ms(wifi_lost_ms) / 1000), wifiStatusStr(WiFi.status()), (unsigned)wifi_last_reason,
+                  wifiReasonStr(wifi_last_reason), wifi_attempts, (unsigned long)fb_ok, (unsigned long)fb_offline,
+                  (unsigned)ESP.getFreeHeap());
 }
 
 // ==================== METRICS → FIREBASE ====================
@@ -588,32 +814,60 @@ void pushPerformanceMetrics() {
     net_delay, kbps, goodput, (unsigned long)net_retx, cum_red, pkt_red,
     loc_n ? loc_sum / loc_n : -1.0f, (unsigned long)now);
   queueFirebase("PATCH", "/.json", body);
+  last_perf.pdr = net_pdr; last_perf.loss = tot_exp ? 100.0f - net_pdr : 0; last_perf.delay = net_delay;
+  last_perf.kbps = kbps; last_perf.red_b = cum_red; last_perf.red_p = pkt_red; last_perf.loc = loc_n ? loc_sum / loc_n : -1.0f;
+  last_perf.rx = tot_rx; last_perf.exp = tot_exp; last_perf.retx = net_retx;
 
-  Serial.printf_P(PSTR("[PERF] PDR=%.1f%%(%lu/%lu) dly=%.1fms tp=%.3fkbps ret=%lu red=%.1f%%B/%.1f%%pkt locerr=%.2fm\n"),
-    net_pdr, (unsigned long)tot_rx, (unsigned long)tot_exp, net_delay, kbps,
+  LOGV("[PERF] PDR=%.1f%% (%lu/%lu) loss=%.1f%% avg_delay=%.1f ms throughput=%.3f kbps goodput=%.3f kbps retransmissions=%lu reduction=%.1f%% bytes/%.1f%% pkts avg_loc_err=%.2f m\n",
+    net_pdr, (unsigned long)tot_rx, (unsigned long)tot_exp, tot_exp ? 100.0f - net_pdr : 0, net_delay, kbps, goodput,
     (unsigned long)net_retx, cum_red, pkt_red, loc_n ? loc_sum / loc_n : -1.0f);
 
-  // ---- Part 2: compact MAC + topology push ----
-  uint32_t net_cca = mesh.mac_stats.cca_busy_count + mesh.neighbors[1].reported_cca_busy
-                     + mesh.neighbors[2].reported_cca_busy + mesh.neighbors[3].reported_cca_busy;
-  uint32_t net_retries2 = mesh.mac_stats.total_retries + mesh.neighbors[1].reported_retries
-                          + mesh.neighbors[2].reported_retries + mesh.neighbors[3].reported_retries;
+  // ---- Part 2: MAC activity, duty cycle, topology ----
+  uint32_t net_cca = mesh.mac_stats.cca_busy_count, net_bo = mesh.mac_stats.total_backoffs;
+  uint32_t net_to = mesh.mac_stats.total_acks_timeout, net_drop = mesh.mac_stats.total_drops;
+  for (int i = 1; i <= 3; i++) {
+    net_cca += mesh.neighbors[i].reported_cca_busy;
+    net_bo += mesh.neighbors[i].reported_backoffs;
+    net_to += mesh.neighbors[i].reported_ack_timeouts;
+    net_drop += mesh.neighbors[i].reported_drops;
+  }
   uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
   float duty4 = total ? mesh.tdma.active_time_ms * 100.0f / total : 100.0f;
   float duty_sum = 0; int duty_n = 0;
   for (int i = 1; i <= 3; i++) if (recently(mesh.neighbors[i].last_hello_ms, HELLO_TIMEOUT_MS)) { duty_sum += mesh.neighbors[i].reported_duty_pct; duty_n++; }
-  // Single compact PATCH combining MAC + duty + topology
+
+  bool n3_link = mesh.neighbors[3].link_alive;
   len = snprintf(body, sizeof(body),
-    "{\"perf/mac\":{\"cca\":%lu,\"retries\":%lu,\"acks_ok\":%lu,\"drops\":%lu,\"dup\":%lu},"
-    "\"perf/duty\":{\"avg_pct\":%.1f,\"sink_pct\":%.1f,\"ts\":%lu},"
-    "\"route/topo\":{\"N1_nh\":\"%s\",\"N2_nh\":\"%s\",\"N3_nh\":\"%s\","
-    "\"N1_ok\":%s,\"N2_ok\":%s,\"N3_ok\":%s,\"sched\":N%d,\"ts\":%lu}}",
-    (unsigned long)net_cca, (unsigned long)net_retries2,
-    (unsigned long)mesh.mac_stats.total_acks_ok, (unsigned long)mesh.mac_stats.total_drops,
-    (unsigned long)mesh.mac_stats.dup_rx,
-    duty_n ? duty_sum / duty_n : duty4, duty4, (unsigned long)now,
+    "{\"perf/throughput\":{\"kbps\":%.3f,\"goodput_kbps\":%.3f,\"window_ms\":%lu,\"timestamp\":%lu},"
+    "\"perf/mac\":{\"cca_busy\":%lu,\"backoffs\":%lu,\"retries\":%lu,\"network_retries\":%lu,"
+    "\"network_cca_busy\":%lu,\"network_backoffs\":%lu,\"network_ack_timeouts\":%lu,\"network_drops\":%lu,"
+    "\"drops\":%lu,\"acks_ok\":%lu,\"acks_timeout\":%lu,\"dup_rx\":%lu},",
+    kbps, goodput, (unsigned long)elapsed, (unsigned long)now,
+    (unsigned long)mesh.mac_stats.cca_busy_count, (unsigned long)mesh.mac_stats.total_backoffs,
+    (unsigned long)mesh.mac_stats.total_retries, (unsigned long)net_retx,
+    (unsigned long)net_cca, (unsigned long)net_bo, (unsigned long)net_to, (unsigned long)net_drop,
+    (unsigned long)mesh.mac_stats.total_drops, (unsigned long)mesh.mac_stats.total_acks_ok,
+    (unsigned long)mesh.mac_stats.total_acks_timeout, (unsigned long)mesh.mac_stats.dup_rx);
+  len += snprintf(body + len, sizeof(body) - len, "\"perf/mac_nodes\":{");
+  for (int i = 1; i <= 3; i++) {
+    route_neighbor_t& nb = mesh.neighbors[i];
+    len += snprintf(body + len, sizeof(body) - len,
+      "%s\"N%d\":{\"retries\":%u,\"cca_busy\":%u,\"backoffs\":%u,\"ack_timeouts\":%u,\"drops\":%u,\"duty_pct\":%u}",
+      i > 1 ? "," : "", i, nb.reported_retries, nb.reported_cca_busy, nb.reported_backoffs,
+      nb.reported_ack_timeouts, nb.reported_drops, nb.reported_duty_pct);
+  }
+  len += snprintf(body + len, sizeof(body) - len,
+    "},\"perf/duty_cycle\":{\"duty_cycle_pct\":%.1f,\"sink_duty_pct\":%.1f,\"active_ms\":%lu,\"sleep_ms\":%lu,\"timestamp\":%lu},",
+    duty_n ? duty_sum / duty_n : duty4, duty4, (unsigned long)mesh.tdma.active_time_ms,
+    (unsigned long)mesh.tdma.sleep_time_ms, (unsigned long)now);
+  len += snprintf(body + len, sizeof(body) - len,
+    "\"route/topology\":{\"N1_next\":\"%s\",\"N2_next\":\"%s\",\"N3_next\":\"%s\","
+    "\"N1_alive\":%s,\"N2_alive\":%s,\"N3_alive\":%s,\"N3_N4_link\":%s,"
+    "\"N1_path\":\"%s\",\"N2_path\":\"%s\",\"N3_path\":\"%s\",\"scheduler\":\"N%d\",\"timestamp\":%lu}}",
     nextHopName(1, snap[1].last_path), nextHopName(2, snap[2].last_path), nextHopName(3, snap[3].last_path),
     node_active[1] ? "true" : "false", node_active[2] ? "true" : "false", node_active[3] ? "true" : "false",
+    n3_link ? "true" : "false",
+    snap[1].last_path, snap[2].last_path, snap[3].last_path,
     mesh.tdma.sched_issuer ? mesh.tdma.sched_issuer : 3, (unsigned long)now);
   queueFirebase("PATCH", "/.json", body);
 }
@@ -667,7 +921,7 @@ void checkSchedulerFailover() {
     bool n2 = mesh.neighbors[2].link_alive || recently(last_activity_ms[2], NODE_ACTIVE_TIMEOUT_MS);
     if (!failoverActive || n1 != failN1 || n2 != failN2) {
       if (!failoverActive) {
-        Serial.printf_P(PSTR("[N4] N3 silent %lums — failover\n"),
+        Serial.printf("[N4] *** N3 silent for %lu ms — N4 takes over TDMA scheduling ***\n",
                       (unsigned long)(n3_last ? wsn_age_ms(n3_last) : millis()));
       }
       failoverActive = true;
@@ -679,7 +933,7 @@ void checkSchedulerFailover() {
   } else if (failoverActive && !n3_silent) {
     failoverActive = false;
     mesh.sched_is_coordinator = false;
-    Serial.println(F("[N4] N3 back—schedule returned"));
+    Serial.println("[N4] N3 is back — schedule control returned to the cluster head");
   }
 }
 
@@ -705,28 +959,25 @@ void checkDashboardControls() {
     p1 = remote_cmd.p1;
     p2 = remote_cmd.p2;
     remote_cmd.pending = false;
-    Serial.printf_P(PSTR("[CTRL-R] %s p1=%d p2=%d\n"), cmd.c_str(), p1, p2);
+    Serial.printf("[CTRL-REMOTE] Executing dashboard command: %s (p1=%d p2=%d)\n", cmd.c_str(), p1, p2);
   } else if (wsn_read_serial_line(cmd)) {
     if (cmd.startsWith("kill ") && cmd.length() >= 8) {
       p1 = cmd.charAt(5) - '0';
       p2 = cmd.charAt(7) - '0';
       cmd = "kill";
-    } else if (cmd.startsWith("log ") && cmd.length() >= 5) {
-      p1 = cmd.charAt(4) - '0';
-      cmd = "log";
     }
   }
   if (cmd.length() == 0) return;
 
   if (cmd == "collision") {
-    Serial.println(F("[CTRL] COLLISION_TEST broadcast"));
+    Serial.println("[CTRL] Broadcasting COLLISION_TEST (N1+N2 contend at next CAP)");
     broadcastCtrl(CTRL_COLLISION_TEST, 0, 0);
   } else if (cmd == "kill") {
     if (p1 < 1 || p1 > NUM_NODES || p2 < 1 || p2 > NUM_NODES || p1 == p2) {
-      Serial.println(F("[CTRL] Usage: kill a b"));
+      Serial.println("[CTRL] Usage: kill <a> <b>   e.g. kill 3 4");
       return;
     }
-    Serial.printf_P(PSTR("[CTRL] KILL N%d↔N%d\n"), p1, p2);
+    Serial.printf("[CTRL] Broadcasting KILL_LINK N%d↔N%d (software failure injection)\n", p1, p2);
     broadcastCtrl(CTRL_KILL_LINK, (uint8_t)p1, (uint8_t)p2);
     if (p1 == SINK_ID || p2 == SINK_ID) {
       uint8_t other = (p1 == SINK_ID) ? p2 : p1;
@@ -734,22 +985,16 @@ void checkDashboardControls() {
       mesh.killed_links[other] = true;
     }
   } else if (cmd == "restore") {
-    Serial.println(F("[CTRL] RESTORE broadcast"));
+    Serial.println("[CTRL] Broadcasting RESTORE_LINKS");
     broadcastCtrl(CTRL_RESTORE_LINKS, 0, 0);
     for (int i = 1; i <= NUM_NODES; i++) mesh.killed_links[i] = false;
     mesh.hello_triggered = true;
   } else if (cmd == "status") {
     mesh_print_status();
     ble_print_status();
-  } else if (cmd == "log") {
-    if (p1 >= 0 && p1 <= 2) {
-      wsn_log_level = (uint8_t)p1;
-      Serial.printf_P(PSTR("[LOG] Level=%d\n"), wsn_log_level);
-    } else {
-      Serial.println(F("[LOG] Usage: log <0|1|2>"));
-    }
+    pushPerformanceMetrics();
   } else if (!ble_command(cmd)) {
-    Serial.println(F("[CTRL] Cmds: collision|kill A B|restore|status|log 0-2|ble|cal"));
+    Serial.printf("[CTRL] Unknown command '%s'. Commands: collision | kill A B | restore | status | ble | cal <id> <m> | setn <n>\n", cmd.c_str());
   }
 }
 
@@ -770,9 +1015,9 @@ bool jsonCmd(const String& resp, char* out, size_t n) {
 // ==================== FreeRTOS TASKS ====================
 
 void cloudTask(void* param) {
-  Serial.println(F("[Cloud] Task started on Core 0"));
-  fbClient.setInsecure();   // skip cert check (self-signed / firebase cert)
-  fbClient.setTimeout(5);  // 5 s TLS handshake timeout
+  Serial.println("[Cloud] Task started on Core 0");
+  fbClient.setInsecure();
+  fbClient.setTimeout(2);
 
   static firebase_msg_t init;
   strcpy(init.method, "PATCH");
@@ -782,9 +1027,10 @@ void cloudTask(void* param) {
 
   static firebase_msg_t msg;
   while (true) {
-    if (xQueueReceive(firebaseQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(firebaseQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE && wifiConnected) {
       if (!executeFirebase(msg)) {
-        Serial.printf("[Cloud] Firebase %s %s FAILED\n", msg.method, msg.path);
+        fb_fail++;
+        LOGE("[Cloud] Firebase upload FAILED (code %d) — see the HTTP line above\n", fb_last_code);
       }
     }
 
@@ -817,26 +1063,8 @@ void cloudTask(void* param) {
       fbHttp.end();
     }
 
-    // Wi-Fi watchdog: 30 s between reconnect attempts to avoid
-    // flooding the radio (which starves ESP-NOW when WiFi is down)
-    if (millis() - lastWifiCheck > 30000) {
-      lastWifiCheck = millis();
-      if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-        Serial.println(F("[WiFi] Lost — draining Firebase queue"));
-        wifiConnected = false;
-        fbClient.stop();
-        // Drain queue + batch so stale data doesn't fill memory
-        { firebase_msg_t tmp;
-          while (xQueueReceive(firebaseQueue, &tmp, 0) == pdTRUE) fb_dropped++; }
-        fb_batch_len = 0; fb_batch[0] = '\0';
-      } else if (WiFi.status() != WL_CONNECTED) {
-        connectWiFi();   // attempt reconnect (includes disconnect+reset inside)
-      } else if (!wifiConnected) {
-        wifiConnected = true;
-        fbClient.stop(); // fresh TLS session after reconnect
-        Serial.println(F("[WiFi] Reconnected — resuming Firebase"));
-      }
-    }
+    // Wi-Fi watchdog / channel-pinned reconnect (non-blocking)
+    wifiMaintain();
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -848,7 +1076,6 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 4 (Sink / Gateway) BOOTING =====");
-  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   memset(origin_stats, 0, sizeof(origin_stats));
   firebaseQueue = xQueueCreate(FIREBASE_QUEUE_SIZE, sizeof(firebase_msg_t));
@@ -860,11 +1087,13 @@ void setup() {
 
   // 2. Wi-Fi FIRST (the AP decides the channel the whole mesh will use)
   connectWiFi();
-  if (wifiConnected) {
-    Serial.printf_P(PSTR("[N4] WiFi channel=%d — ESP-NOW mesh will use this channel\n"), WiFi.channel());
-  }
 
-  // 3. ESP-NOW mesh init (uses WiFi channel set above)
+  // NTP time only orders dashboard history keys; the mesh does not depend on it
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
+  // 3. ESP-NOW mesh on the same channel
+  fbClient.setInsecure();
+  fbClient.setTimeout(2);
   mesh_init();
 
   // 4. N4 is the time reference and routing root
@@ -876,11 +1105,11 @@ void setup() {
   mesh.next_hop_to_sink = SINK_ID;
   last_metrics_ms = millis();
 
-  // 5. Cloud uploads on core 0 (TLS/WiFiClientSecure needs ~11 KB stack)
+  // 5. Cloud uploads on core 0
   xTaskCreatePinnedToCore(cloudTask, "cloudTask", 12288, NULL, 1, NULL, 0);
 
-  Serial.println(F("===== N4 SETUP COMPLETE ====="));
-  Serial.println(F("Cmds: collision|kill X Y|restore|status|log 0-2"));
+  Serial.println("===== N4 SETUP COMPLETE =====\n");
+  Serial.println("Serial commands: collision | kill X Y | restore | status | log 0/1/2 | ble | cal <id> <m> | setn <n>");
 }
 
 // ==================== MAIN LOOP ====================
@@ -902,7 +1131,7 @@ void loop() {
     lastBleReport = now;
     ble_report_payload_t rpt = ble_build_report();
     if (rpt.num_neighbors > 0) {
-      Serial.println(F("[SINK] BLE self-report (N4):"));
+      LOGV("[SINK] BLE self-report (N4):\n");
       localizeReport(rpt);
     }
   }
@@ -931,22 +1160,6 @@ void loop() {
     fb_flush();
   }
 
-  // 6. Status
-  if (now - lastStatusPrint >= 15000) {
-    lastStatusPrint = now;
-    mesh_print_status();
-    Serial.printf_P(PSTR("--- GW: WiFi=%s heap=%uB dropped=%lu ---\n"),
-                    wifiConnected ? "OK" : "DOWN", (unsigned)ESP.getFreeHeap(), (unsigned long)fb_dropped);
-    Serial.println(F("--- Sink Stats ---"));
-    for (int i = 1; i <= 3; i++) {
-      origin_stats_t& os = origin_stats[i];
-      if (!os.ever_seen) continue;
-      uint32_t expected = (uint32_t)(os.highest_seq - os.first_seq) + 1;
-      uint32_t rx = (os.unique_rx > expected) ? expected : os.unique_rx;
-      float pdr = expected ? rx * 100.0f / expected : 0;
-      float avg_delay = os.delay_samples ? (float)os.total_delay_ms / os.delay_samples : 0;
-      Serial.printf_P(PSTR("  N%d rx=%lu/%lu PDR=%.1f%% dly=%.0fms path=%s\n"),
-        i, (unsigned long)rx, (unsigned long)expected, pdr, avg_delay, os.last_path);
-    }
-  }
+  // 6. Compact 5 s status block (full detail: type 'status' or 'log 2')
+  wsn_summary_tick();
 }

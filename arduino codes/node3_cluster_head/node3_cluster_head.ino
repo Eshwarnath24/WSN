@@ -20,6 +20,11 @@
 #endif
 
 // ==================== SENSOR CONFIG ====================
+// The guidelines require sensing on N1 and N2 only; N3's IR sensor is an
+// optional extra. Set to 0 if no IR module is wired to GPIO4.
+#ifndef N3_HAS_IR_SENSOR
+#define N3_HAS_IR_SENSOR 1
+#endif
 #define IR_DO_PIN     4       // Digital obstacle sensor (active-low: LOW = obstacle)
 #define DEBOUNCE_MS   50
 #define SENSOR_READ_INTERVAL_MS 250
@@ -49,6 +54,21 @@ uint32_t lastScheduleCheck = 0;
 uint32_t lastSensorRead = 0;
 uint32_t lastStatusPrint = 0;
 uint32_t lastBleReport = 0;
+
+// ==================== 5 s SUMMARY LINE ====================
+void app_summary() {
+  uint32_t cin = mesh.agg.cum_bytes_in, cout = mesh.agg.cum_bytes_out;
+  float red_b = cin ? (1.0f - (float)cout / cin) * 100.0f : 0;
+  float red_p = mesh.agg.cum_pkts_in ? (1.0f - (float)mesh.agg.cum_pkts_out / mesh.agg.cum_pkts_in) * 100.0f : 0;
+  Serial.printf(" AGG   : %u readings in (from N1+N2) → %u aggregate packets out | data reduction %.1f%% bytes, %.1f%% packets | buffered now N1=%d N2=%d\n",
+                mesh.agg.cum_pkts_in, mesh.agg.cum_pkts_out, red_b, red_p, mesh.agg.n1_count, mesh.agg.n2_count);
+#if N3_HAS_IR_SENSOR
+  Serial.printf(" SENSOR: IR obstacle %s | scheduler: schedule v%u (%s)\n", irObstacle ? "DETECTED" : "clear",
+                mesh.tdma.sched_version, mesh.tdma.sched_reason);
+#else
+  Serial.printf(" SCHED : coordinator, schedule v%u (%s)\n", mesh.tdma.sched_version, mesh.tdma.sched_reason);
+#endif
+}
 
 // ==================== APP CALLBACKS ====================
 void app_on_data_for_me(const wsn_packet_t& pkt, int rssi) {
@@ -94,10 +114,10 @@ bool agg_buffer_data(const wsn_packet_t& pkt) {
     if (mag > VIBRATION_ALERT_THRESHOLD) { lastN1AnomalyMs = millis(); aggUrgent = true; anomaly = true; }
   }
   if (stored) {
-    Serial.printf("[AGG] Buffered N%d data: seq=%d (count=%d)%s\n", pkt.origin_id, pkt.seq_num, count,
+    LOGV("[AGG] Buffered N%d data: seq=%d (count=%d)%s\n", pkt.origin_id, pkt.seq_num, count,
                   anomaly ? " — N1 ANOMALY" : "");
   } else {
-    Serial.printf("[AGG] Buffer full for N%d — forwarding seq=%d individually\n", pkt.origin_id, pkt.seq_num);
+    LOGE("[AGG] Buffer full for N%d — forwarding seq=%d individually\n", pkt.origin_id, pkt.seq_num);
   }
   return stored;
 }
@@ -194,11 +214,11 @@ void agg_send_window() {
   float cum_red = (cin > 0) ? (1.0f - (float)cout / cin) * 100.0f : 0.0f;
   float pkt_red = (pin > 0) ? (1.0f - (float)pout / pin) * 100.0f : 0.0f;
 
-  Serial.printf("[AGG] Window: N1 %d pkt(s) [seq %d-%d] mean=(%.2f,%.2f,%.2f) max|a|=%.2f + N2 %d pkt(s) [seq %d-%d] flame max=%.0f min=%.0f DO=%d + N3 IR=%d\n",
+  LOGV("[AGG] Window: N1 %d pkt(s) [seq %d-%d] mean=(%.2f,%.2f,%.2f) max|a|=%.2f + N2 %d pkt(s) [seq %d-%d] flame max=%.0f min=%.0f DO=%d + N3 IR=%d\n",
                 n1c, ap.n1_seq_start, ap.n1_seq_end, ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z,
                 ap.n1_accel_max, n2c, ap.n2_seq_start, ap.n2_seq_end, ap.n2_flame_analog_max,
                 ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n3_ir_obstacle);
-  Serial.printf("[AGG] Data reduction: window %d pkts/%d B in → 1 pkt/%d B out = %.1f%% bytes | cumulative %.1f%% bytes, %.1f%% packets\n",
+  LOGV("[AGG] Data reduction: window %d pkts/%d B in → 1 pkt/%d B out = %.1f%% bytes | cumulative %.1f%% bytes, %.1f%% packets\n",
                 n1c + n2c, ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red, pkt_red);
 
   mesh_own_tx_load(OWN_TX_DATA, mesh_build_agg_packet(ap));
@@ -216,7 +236,7 @@ void check_schedule_updates() {
 
   bool n1 = nodePresent(1);
   bool n2 = nodePresent(2);
-  bool alert = n1 && lastN1AnomalyMs != 0 && (millis() - lastN1AnomalyMs) < VIBRATION_ALERT_HOLD_MS;
+  bool alert = n1 && lastN1AnomalyMs != 0 && wsn_age_ms(lastN1AnomalyMs) < VIBRATION_ALERT_HOLD_MS;
 
   const char* reason = nullptr;
   if (!schedPublished)                 reason = "INIT: default schedule";
@@ -233,7 +253,7 @@ void check_schedule_updates() {
   schedVersion++;
   schedule_payload_t sp;
   tdma_build_schedule(sp, n1, n2, true, alert, reason, schedVersion, MY_NODE_ID);
-  Serial.printf("[TDMA] *** Schedule update v%u: %s ***\n", schedVersion, reason);
+  LOGE("[TDMA] *** Schedule update v%u: %s ***\n", schedVersion, reason);
   tdma_publish_schedule(sp);
 }
 
@@ -243,13 +263,16 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 3 (Cluster Head / Aggregator / IR) BOOTING =====");
-  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
+#if N3_HAS_IR_SENSOR
   pinMode(IR_DO_PIN, INPUT);
   lastRawReading = digitalRead(IR_DO_PIN);
   stableState = lastRawReading;
   lastChangeTime = millis();
   Serial.println("[SENSOR] IR obstacle sensor configured (GPIO 4)");
+#else
+  Serial.println("[SENSOR] No IR sensor fitted (N3_HAS_IR_SENSOR=0) — N3 works as cluster head/aggregator/router only");
+#endif
 
   ble_init();
   ble_boot_discovery();
@@ -281,7 +304,7 @@ void loop() {
   }
 
   // 3. IR sensor with debounce
-  if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
+  if (N3_HAS_IR_SENSOR && now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
     lastSensorRead = now;
     int raw = digitalRead(IR_DO_PIN);
     if (raw != lastRawReading) {
@@ -292,27 +315,29 @@ void loop() {
       float prev = irObstacle;
       stableState = lastRawReading;
       irObstacle = (stableState == LOW) ? 1.0f : 0.0f;
-      if (irObstacle != prev) Serial.printf("[SENSOR] IR: %s\n", irObstacle ? "OBSTACLE" : "clear");
+      if (irObstacle != prev) LOGE("[SENSOR] IR: %s\n", irObstacle ? "OBSTACLE" : "clear");
     }
   }
 
   // 4. Aggregation: one AGG per window in my TX slot (S3)
   static uint32_t lastOpportunity = 0xFFFFFFFF;
   if (mesh_take_data_opportunity(lastOpportunity)) {
-    uint32_t frame = tdma_current_frame();
-    bool window_done = !mesh.tdma.synced || aggUrgent || (frame - lastAggFrame) >= AGG_WINDOW_FRAMES;
-    if (mesh_own_tx_busy(OWN_TX_DATA)) {
-      // previous AGG still pending → retransmitted below
-    } else if (window_done) {
-      lastAggFrame = frame;
-      agg_send_window();
+    {
+      uint32_t frame = tdma_current_frame();
+      bool window_done = !mesh.tdma.synced || aggUrgent || (frame - lastAggFrame) >= AGG_WINDOW_FRAMES;
       if (mesh_own_tx_busy(OWN_TX_DATA)) {
-        LOGE("[TDMA] %s: TX opportunity — sending AGG seq=%d via N%d\n",
-             epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
-             mesh.next_hop_to_sink);
+        // previous AGG still pending → retransmitted below
+      } else if (window_done) {
+        lastAggFrame = frame;
+        agg_send_window();
+        if (mesh_own_tx_busy(OWN_TX_DATA)) {
+          LOGV("[TDMA] %s: TX opportunity — sending AGG seq=%d via N%d\n",
+                        epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+                        mesh.next_hop_to_sink);
+        }
+      } else {
+        mesh_note_unused_slot("aggregation window still collecting");
       }
-    } else {
-      mesh_note_unused_slot("aggregation window still collecting");
     }
   }
   if (mesh_own_tx_busy(OWN_TX_DATA) && mesh_retry_window_open()) {
@@ -322,15 +347,6 @@ void loop() {
   // 5. Dynamic schedule (Cluster Head responsibility)
   check_schedule_updates();
 
-  // 6. Status
-  if (now - lastStatusPrint >= 10000) {
-    lastStatusPrint = now;
-    mesh_print_status();
-    ble_print_status();
-    Serial.printf("[AGG] Buffer: N1=%d pkts, N2=%d pkts, bytes_in=%d | cumulative in=%lu B/%u pkts out=%lu B/%u pkts | overflow=%lu\n",
-                  mesh.agg.n1_count, mesh.agg.n2_count, mesh.agg.bytes_received,
-                  (unsigned long)mesh.agg.cum_bytes_in, mesh.agg.cum_pkts_in,
-                  (unsigned long)mesh.agg.cum_bytes_out, mesh.agg.cum_pkts_out,
-                  (unsigned long)mesh.agg.overflow_drops);
-  }
+  // 6. Compact 5 s status block (full detail: type 'status' or 'log 2')
+  wsn_summary_tick();
 }

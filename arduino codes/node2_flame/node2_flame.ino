@@ -32,6 +32,13 @@ uint32_t lastSensorRead = 0;
 uint32_t lastStatusPrint = 0;
 uint32_t lastBleReport = 0;
 
+// ==================== 5 s SUMMARY LINE ====================
+void app_summary() {
+  Serial.printf(" SENSOR: flame AO=%.0f DO=%.0f → %s | readings sent %u | relayed for others %lu\n",
+                flameAnalog, flameDigital, flameDigital == 0 ? "FIRE DETECTED" : "normal",
+                (unsigned)(mesh.data_seq_counter - 1), (unsigned long)mesh.pkts_forwarded);
+}
+
 // ==================== APP CALLBACKS ====================
 void app_on_data_for_me(const wsn_packet_t& pkt, int rssi) {
   Serial.printf("[APP] Data arrived for N2: type=%s origin=N%d seq=%d\n",
@@ -40,7 +47,7 @@ void app_on_data_for_me(const wsn_packet_t& pkt, int rssi) {
 
 // Intermediate hop: N2 is a relay — forward normally (queued for RELAY slot / CAP)
 bool app_on_data_transit(const wsn_packet_t& pkt, int rssi) {
-  Serial.printf("[RELAY] Relaying %s from origin N%d seq=%d (prev hop N%d)\n",
+  LOGV("[RELAY] Relaying %s from origin N%d seq=%d (prev hop N%d)\n",
                 msgTypeStr(pkt.msg_type), pkt.origin_id, pkt.seq_num, pkt.src_id);
   return false;
 }
@@ -55,7 +62,6 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 2 (Flame Sensor + Relay) BOOTING =====");
-  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   // 1. Sensor pins
   pinMode(FLAME_DO_PIN, INPUT);
@@ -106,7 +112,7 @@ void loop() {
     static uint8_t printDiv = 0;
     if (++printDiv >= 4) {
       printDiv = 0;
-      Serial.printf("[SENSOR] Flame: analog=%.0f digital=%.0f (%s)\n",
+      LOGV("[SENSOR] Flame: analog=%.0f digital=%.0f (%s)\n",
                     flameAnalog, flameDigital,
                     flameDigital == 0 ? "FIRE DETECTED!" : "Normal");
     }
@@ -115,26 +121,24 @@ void loop() {
   // 6. TDMA: one new packet per assigned TX slot occurrence (S2)
   static uint32_t lastOpportunity = 0xFFFFFFFF;
   if (mesh_take_data_opportunity(lastOpportunity)) {
-    if (mesh_own_tx_busy(OWN_TX_DATA)) {
-      // previous packet still pending → retransmitted below
-    } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
-      mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(flameAnalog, flameDigital, 0, "flame"));
-      hasNewSensorData = false;
-      LOGE("[TDMA] %s: TX opportunity — sending flame reading seq=%d via N%d\n",
-           epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
-           mesh.next_hop_to_sink);
-    } else if (mesh.tdma.synced) {
-      mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
+    {
+      if (mesh_own_tx_busy(OWN_TX_DATA)) {
+        // previous packet still pending → retransmitted below
+      } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
+        mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(flameAnalog, flameDigital, 0, "flame"));
+        hasNewSensorData = false;
+        LOGV("[TDMA] %s: TX opportunity — sending flame reading seq=%d via N%d\n",
+                      epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+                      mesh.next_hop_to_sink);
+      } else if (mesh.tdma.synced) {
+        mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
+      }
     }
   }
   if (mesh_own_tx_busy(OWN_TX_DATA) && mesh_retry_window_open()) {
     mesh_own_tx_service(OWN_TX_DATA);
   }
 
-  // 7. Print status periodically
-  if (now - lastStatusPrint >= 10000) {
-    lastStatusPrint = now;
-    mesh_print_status();
-    ble_print_status();
-  }
+  // 7. Compact 5 s status block (full detail: type 'status' or 'log 2')
+  wsn_summary_tick();
 }

@@ -48,6 +48,21 @@ uint32_t lastSensorRead = 0;
 uint32_t lastStatusPrint = 0;
 uint32_t lastBleReport = 0;
 
+// ==================== 5 s SUMMARY LINE ====================
+float vibrationMagnitude();
+
+void app_summary() {
+  if (sensorConnected) {
+    float mag = vibrationMagnitude();
+    Serial.printf(" SENSOR: accelerometer @0x%02X | AX %.2f AY %.2f AZ %.2f | |a| %.2f m/s^2 %s | readings sent %u\n",
+                  mpuAddr, accelX, accelY, accelZ, mag,
+                  mag > VIBRATION_ALERT_THRESHOLD ? "<< VIBRATION ALERT" : "(normal)",
+                  (unsigned)(mesh.data_seq_counter - 1));
+  } else {
+    Serial.println(" SENSOR: NO ACCELEROMETER — check wiring (VCC 3V3, GND, SDA GPIO21, SCL GPIO22); no data is sent");
+  }
+}
+
 // ==================== APP CALLBACKS ====================
 void app_on_data_for_me(const wsn_packet_t& pkt, int rssi) {
   Serial.printf("[APP] Data arrived for N1: type=%s origin=N%d seq=%d\n",
@@ -161,7 +176,6 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 1 (Vibration Sensor) BOOTING =====");
-  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   // 1. Sensor
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -212,7 +226,7 @@ void loop() {
       static uint8_t printDiv = 0;
       if (++printDiv >= 4) {   // print once per second
         printDiv = 0;
-        Serial.printf("[SENSOR] AX=%.2f AY=%.2f AZ=%.2f mag=%.2f m/s^2%s\n",
+        LOGV("[SENSOR] AX=%.2f AY=%.2f AZ=%.2f mag=%.2f m/s^2%s\n",
                       accelX, accelY, accelZ, vibrationMagnitude(),
                       vibrationMagnitude() > VIBRATION_ALERT_THRESHOLD ? " (ANOMALY)" : "");
       }
@@ -222,16 +236,18 @@ void loop() {
   // 6. TDMA: one new packet per assigned TX slot occurrence
   static uint32_t lastOpportunity = 0xFFFFFFFF;
   if (mesh_take_data_opportunity(lastOpportunity)) {
-    if (mesh_own_tx_busy(OWN_TX_DATA)) {
-      // previous packet still pending → it is retransmitted below
-    } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
-      mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(accelX, accelY, accelZ, "vibration"));
-      hasNewSensorData = false;
-      LOGE("[TDMA] %s: TX opportunity — sending vibration reading seq=%d via N%d\n",
-           epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
-           mesh.next_hop_to_sink);
-    } else if (mesh.tdma.synced) {
-      mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
+    {
+      if (mesh_own_tx_busy(OWN_TX_DATA)) {
+        // previous packet still pending → it is retransmitted below
+      } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
+        mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(accelX, accelY, accelZ, "vibration"));
+        hasNewSensorData = false;
+        LOGV("[TDMA] %s: TX opportunity — sending vibration reading seq=%d via N%d\n",
+                      epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+                      mesh.next_hop_to_sink);
+      } else if (mesh.tdma.synced) {
+        mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
+      }
     }
   }
   // (Re)transmit pending own data in own slot or CAP
@@ -239,10 +255,6 @@ void loop() {
     mesh_own_tx_service(OWN_TX_DATA);
   }
 
-  // 7. Print status periodically
-  if (now - lastStatusPrint >= 10000) {
-    lastStatusPrint = now;
-    mesh_print_status();
-    ble_print_status();
-  }
+  // 7. Compact 5 s status block (full detail: type 'status' or 'log 2')
+  wsn_summary_tick();
 }
