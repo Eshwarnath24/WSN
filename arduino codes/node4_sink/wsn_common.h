@@ -82,14 +82,17 @@
 #endif
 
 // ==================== BLE CONSTANTS ====================
-#define BLE_SCAN_DURATION_MS  100     // Scan burst; must fit inside the 130 ms SLEEP epoch
-#define BLE_SCAN_PERIOD_MS    3000
+#define BLE_SCAN_DURATION_MS  110     // Scan burst (100% window); must fit inside the 130 ms SLEEP epoch
+#define BLE_SCAN_PERIOD_MS    700     // => a burst in (almost) every superframe
 #define BLE_BOOT_DISCOVERY_MS 1500    // Initial BLE discovery before Wi-Fi start
-#define BLE_ADV_INTERVAL_MS   100
+#define BLE_ADV_INTERVAL_MS   50      // 50–70 ms adverts => several per 110 ms scan burst
 #define BLE_TX_POWER_1M       (-59)   // Calibrated RSSI at 1 m (calibrate per environment)
 #define BLE_PATH_LOSS_N       2.2f    // Path loss exponent (indoor)
 #define BLE_EWMA_ALPHA        0.3f
-#define BLE_NEIGHBOR_EXPIRY_MS 15000  // Forget BLE neighbours not seen for this long
+#define BLE_NEIGHBOR_EXPIRY_MS 30000  // Forget BLE neighbours not seen for this long
+#define BLE_MIN_DIST_M        0.2f    // Distance clamp (RSSI-derived ranges)
+#define BLE_MAX_DIST_M        15.0f
+#define BLE_AREA_MARGIN_M     2.0f    // Localization estimate kept within reference area ± margin
 #define BLE_REPORT_PERIOD_MS  10000
 
 // ==================== SENSOR ALERT THRESHOLDS ====================

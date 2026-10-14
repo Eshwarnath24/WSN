@@ -766,3 +766,31 @@ node dashtest/test.mjs <dashboardDir> <rundir>/firebase.jsonl [untilMs] [label]
 ```
 - Logs: `sim/run_orig*` (original firmware), `sim/run_final`, `sim/run_linkdown`, `sim/run_loss10` (proposed).
 - Stubs: `sim/stubs/` (written by me; behaviour approximates the ESP32 APIs and is not the real SDK).
+
+---
+
+## 30. Hardware Test Round 1: Findings and Fixes
+
+**Source:** serial logs from your 4 physical boards, provided after the first flash.
+
+**Confirmed working on hardware:**
+- TDMA sync, including multi-hop time sync: N1 shows `synced: YES (neighbour)` because it cannot hear N4.
+- Adaptive multi-hop routing: N1→N2→N3→N4, chosen because the N1–N3 link only had 40% ACK success.
+- Poison reverse (`cost=inf` on reverse links).
+- CSMA with real contention (`CCA: BUSY … Contention … defer`). This shows that promiscuous capture of ESP-NOW frames works on these boards.
+- ACKs with 4–13 ms RTT, retransmission, the aggregation pipeline, and multi-hop BLE report forwarding.
+- Sink PDR 100% for N2 and N3.
+
+| # | Symptom in the hardware log | Cause | Fix |
+|---|---|---|---|
+| HW1 | N1 prints no `[SENSOR]` lines, `S1 unused (no new sensor sample)`, sink shows `N1[0]` | The accelerometer never initialised. Most likely a GY-521 **clone (MPU6500/9250)** that `Adafruit_MPU6050::begin()` rejects on WHO_AM_I; the proposed code then retried silently. | Direct-register driver (no Adafruit library). Probes 0x68/0x69, prints WHO_AM_I and the chip name, lists all I2C devices if none is found, and warns every 5 s while there is no sensor. |
+| HW2 | Neighbours flip between `not discovered` and `expired`; N3 often finds 0 neighbours | 100 ms bursts every 3 s at 80% scan duty, adverts every 100–200 ms, Wi-Fi/BLE coexistence (N3 is the busiest Wi-Fi node), 15 s expiry | Burst of 110 ms at 100% scan duty in **every** SLEEP epoch, adverts every 50–70 ms, every advert used as an RSSI sample (duplicates on), 30 s expiry, one summary line per scan |
+| HW3 | Localization error 235–667 m | Distances of 16–48 m from RSSI −85…−96 dBm (uncalibrated model, A = −59, n = 2.2) fed into closed-form trilateration, which is unstable | Distances clamped to 0.2–15 m; weighted non-linear least squares restricted to the deployment area; range residual reported (good/fair/poor); **calibration from the Serial Monitor** (`cal <id> <m>`, `setn`, `seta`), saved in flash |
+| HW4 | N4: `[Firebase] Queue FULL`, `Firebase POST … FAILED` | One HTTPS request per update (about 4/s) is more than the ESP32 TLS client can sustain; 1.5 s timeout | All updates batched into **one multi-path PATCH every 2 s**; 5 s timeout; HTTP code and free heap logged on failure; NTP-ordered history keys |
+| HW5 | `reference=(1.00,1.50)` printed for N3 | `NODE_TRUE_POS` still holds the example layout | **You must enter your tape-measured positions** |
+
+**Testing after the fixes:**
+- Host build of all 4 sketches: 0 warnings on both ESP-IDF API variants.
+- SIM with an MPU6500 clone (WHO_AM_I = 0x70), BLE noise σ = 6 dB and 2% loss: N1 data delivered (PDR 100%), all Firebase batches valid JSON (41 requests in about 80 s), dashboard shows 3/3 active and 4/4 localized.
+- My JSON validation also found and fixed a bug in the new batching code (it stripped too many closing braces).
+- **Hardware re-test pending.** The simulator cannot reproduce Wi-Fi/BLE radio starvation or real RSSI.

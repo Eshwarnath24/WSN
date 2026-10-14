@@ -27,6 +27,7 @@
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <time.h>
 
 // Wi-Fi / Firebase credentials live in wsn_config.h (keep it out of Git).
 #if __has_include("wsn_config.h")
@@ -40,8 +41,10 @@ const char* WIFI_PASS     = WSN_WIFI_PASS;
 const char* FIREBASE_HOST = WSN_FIREBASE_HOST;
 
 #define WIFI_TIMEOUT_ATTEMPTS 20
-#define FIREBASE_QUEUE_SIZE   16
-#define FB_PAYLOAD_SIZE       1200
+#define FIREBASE_QUEUE_SIZE   3       // batches waiting for upload
+#define FB_PAYLOAD_SIZE       3700    // one batched multi-path PATCH
+#define FB_BATCH_SIZE         3600
+#define FB_FLUSH_PERIOD_MS    2000    // one HTTPS request every 2 s instead of ~4 per second
 #define NODE_ACTIVE_TIMEOUT_MS 8000
 #define N3_SILENT_MS          10000
 #define METRICS_PERIOD_MS     5000
@@ -141,19 +144,90 @@ void connectWiFi() {
   }
 }
 
-// Queue a Firebase request. Called only from the Arduino loop task
-// (sink processing is moved out of the Wi-Fi callback via sinkRxQueue).
-void queueFirebase(const char* method, const char* path, const char* payload) {
-  static firebase_msg_t msg;   // large: keep off the stack
-  strncpy(msg.method, method, sizeof(msg.method) - 1);
-  msg.method[sizeof(msg.method) - 1] = '\0';
-  strncpy(msg.path, path, sizeof(msg.path) - 1);
-  msg.path[sizeof(msg.path) - 1] = '\0';
-  strncpy(msg.payload, payload, sizeof(msg.payload) - 1);
-  msg.payload[sizeof(msg.payload) - 1] = '\0';
-  if (xQueueSend(firebaseQueue, &msg, 0) != pdTRUE) {
-    Serial.println("[Firebase] Queue FULL — dropping message");
+// ---------- Batched Firebase upload ----------
+// Every update is collected into ONE multi-path PATCH ("path": value, ...)
+// that is sent every FB_FLUSH_PERIOD_MS. The real hardware test showed that
+// one HTTPS request per update (~4/s) overflowed the queue on the ESP32.
+// List entries ("POST") get a time-ordered key (NTP time when available).
+static char fb_batch[FB_BATCH_SIZE];
+static int  fb_batch_len = 0;
+static uint32_t fb_dropped = 0;
+
+void fb_key(char* out, size_t n) {
+  static uint8_t ctr = 0;
+  time_t t = time(nullptr);
+  ctr = (ctr + 1) % 100;
+  if (t > 1700000000) {
+    snprintf(out, n, "t%010lu%03u%02u", (unsigned long)t, (unsigned)(millis() % 1000), ctr);
+  } else {
+    snprintf(out, n, "m%010lu%02u", (unsigned long)millis(), ctr);  // before NTP sync
   }
+}
+
+void fb_flush() {
+  if (fb_batch_len == 0) return;
+  static firebase_msg_t msg;   // large: keep off the stack (loop task only)
+  strcpy(msg.method, "PATCH");
+  strcpy(msg.path, "/.json");
+  snprintf(msg.payload, sizeof(msg.payload), "{%s}", fb_batch);
+  if (xQueueSend(firebaseQueue, &msg, 0) != pdTRUE) {
+    fb_dropped++;
+    Serial.printf("[Firebase] Upload still busy — batch of %d B skipped (total skipped %lu)\n",
+                  fb_batch_len, (unsigned long)fb_dropped);
+  }
+  fb_batch_len = 0;
+  fb_batch[0] = '\0';
+}
+
+void fb_append(const char* key, const char* json) {
+  char probe[80];
+  snprintf(probe, sizeof(probe), "\"%s\":", key);
+  if (strstr(fb_batch, probe)) fb_flush();                 // same path twice → send previous first
+  int need = strlen(probe) + strlen(json) + 1;
+  if (need >= FB_BATCH_SIZE) { Serial.printf("[Firebase] Update for %s too large — skipped\n", key); return; }
+  if (fb_batch_len + need >= FB_BATCH_SIZE) fb_flush();
+  fb_batch_len += snprintf(fb_batch + fb_batch_len, FB_BATCH_SIZE - fb_batch_len, "%s%s%s",
+                           fb_batch_len ? "," : "", probe, json);
+}
+
+// Same interface as before: PUT path, POST to a list, or PATCH "/.json" {"a/b":…}
+void queueFirebase(const char* method, const char* path, const char* payload) {
+  char rel[96];
+  const char* p = (path[0] == '/') ? path + 1 : path;
+  strncpy(rel, p, sizeof(rel) - 1);
+  rel[sizeof(rel) - 1] = '\0';
+  char* dot = strstr(rel, ".json");
+  if (dot) *dot = '\0';
+
+  if (strcmp(method, "PATCH") == 0 && rel[0] == '\0') {
+    // Root multi-path object: append its members
+    // strip exactly ONE outer pair of braces: "{ members }" → "members"
+    const char* q = payload;
+    while (*q == ' ') q++;
+    if (*q == '{') q++;
+    int len = strlen(q);
+    while (len > 0 && q[len - 1] == ' ') len--;
+    if (len > 0 && q[len - 1] == '}') len--;
+    // If this block's first path is already in the batch, send the batch first (no duplicate keys)
+    const char* k2 = strchr(q + 1, '"');
+    if (q[0] == '"' && k2) {
+      char probe[80];
+      snprintf(probe, sizeof(probe), "%.*s:", (int)(k2 - q + 1), q);
+      if (strstr(fb_batch, probe)) fb_flush();
+    }
+    if (fb_batch_len + len + 2 >= FB_BATCH_SIZE) fb_flush();
+    if (len + 2 >= FB_BATCH_SIZE) { Serial.println("[Firebase] Metrics block too large — skipped"); return; }
+    fb_batch_len += snprintf(fb_batch + fb_batch_len, FB_BATCH_SIZE - fb_batch_len, "%s%.*s",
+                             fb_batch_len ? "," : "", len, q);
+    return;
+  }
+  if (strcmp(method, "POST") == 0) {
+    char key[24];
+    fb_key(key, sizeof(key));
+    strncat(rel, "/", sizeof(rel) - strlen(rel) - 1);
+    strncat(rel, key, sizeof(rel) - strlen(rel) - 1);
+  }
+  fb_append(rel, payload);
 }
 
 // Execute a Firebase HTTP request (called from cloudTask)
@@ -163,7 +237,7 @@ bool executeFirebase(const firebase_msg_t& msg) {
   for (int attempt = 0; attempt < 2; attempt++) {
     fbHttp.begin(fbClient, url);
     fbHttp.setReuse(true);
-    fbHttp.setTimeout(1500);
+    fbHttp.setTimeout(5000);   // TLS handshake on ESP32 can take 1–3 s
     fbHttp.addHeader("Content-Type", "application/json");
     int code = 0;
     if (strcmp(msg.method, "POST") == 0)       code = fbHttp.POST(msg.payload);
@@ -171,8 +245,11 @@ bool executeFirebase(const firebase_msg_t& msg) {
     else                                       code = fbHttp.PUT(msg.payload);
     fbHttp.end();
     if (code > 0 && code < 400) return true;
+    Serial.printf("[Cloud] HTTP %s %s → code %d (%s), free heap %u B, payload %u B\n",
+                  msg.method, msg.path, code, code < 0 ? "connection/TLS error" : "server rejected",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)strlen(msg.payload));
     fbClient.stop();
-    if (attempt == 0) delay(20);
+    if (attempt == 0) delay(200);
   }
   return false;
 }
@@ -314,7 +391,7 @@ void processAggData(const wsn_packet_t& pkt, int rssi) {
   Serial.printf("[SINK] AGG from N%d seq=%d route=%s: N1[%d] mean=(%.2f,%.2f,%.2f) max=%.2f | N2[%d] flame max=%.0f min=%.0f DO=%d | N3 IR=%d\n",
     pkt.origin_id, pkt.seq_num, route, ap.n1_count, ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z,
     ap.n1_accel_max, ap.n2_count, ap.n2_flame_analog_max, ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n3_ir_obstacle);
-  Serial.printf("[SINK] AGG reduction: window %u B→%u B (%.1f%%) | cumulative bytes %.1f%%, packets %lu→%lu (%.1f%%) | delay N3=%ld ms, N1(oldest)=%ld ms, N2(oldest)=%ld ms\n",
+  Serial.printf("[SINK] AGG reduction: window %u B→%u B (%.1f%%) | cumulative bytes %.1f%%, packets %lu→%lu (%.1f%%) | delay N3=%ld ms, N1(oldest)=%ld ms, N2(oldest)=%ld ms (-1 = no reading)\n",
     ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red,
     (unsigned long)agg_pkts_in_total, (unsigned long)agg_pkts_out_total, pkt_red, (long)d3, (long)d1, (long)d2);
 
@@ -379,15 +456,16 @@ void localizeReport(const ble_report_payload_t& rpt) {
     ids[i] = rpt.entries[i].node_id;
     dists[i] = rpt.entries[i].distance_m;
   }
-  float ex = 0, ey = 0, err = -1;
-  bool ok = ble_localize(id, ids, dists, rpt.num_neighbors, ex, ey, err);
+  float ex = 0, ey = 0, err = -1, rms = 0;
+  bool ok = ble_localize(id, ids, dists, rpt.num_neighbors, ex, ey, err, &rms);
   for (int i = 0; i < rpt.num_neighbors && i < 3; i++) {
     Serial.printf("[SINK]   N%d sees N%d: RSSI=%d dBm → %.2f m\n", id, ids[i], rpt.entries[i].rssi, dists[i]);
   }
   if (ok) {
     loc_error[id] = err;
-    Serial.printf("[SINK] Localization N%d: est=(%.2f,%.2f) reference=(%.2f,%.2f) error=%.2f m | nearest=N%d\n",
-                  id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rpt.nearest_node_id);
+    Serial.printf("[SINK] Localization N%d: est=(%.2f,%.2f) reference=(%.2f,%.2f) error=%.2f m | range residual %.2f m (%s) | nearest=N%d\n",
+                  id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rms,
+                  rms < 1.0f ? "good" : (rms < 3.0f ? "fair" : "poor: calibrate"), rpt.nearest_node_id);
   } else {
     Serial.printf("[SINK] Localization N%d: proximity only (%d anchors) | nearest=N%d\n",
                   id, rpt.num_neighbors, rpt.nearest_node_id);
@@ -652,9 +730,7 @@ void checkDashboardControls() {
     p2 = remote_cmd.p2;
     remote_cmd.pending = false;
     Serial.printf("[CTRL-REMOTE] Executing dashboard command: %s (p1=%d p2=%d)\n", cmd.c_str(), p1, p2);
-  } else if (Serial.available()) {
-    cmd = Serial.readStringUntil('\n');
-    cmd.trim();
+  } else if (wsn_read_serial_line(cmd)) {
     if (cmd.startsWith("kill ") && cmd.length() >= 8) {
       p1 = cmd.charAt(5) - '0';
       p2 = cmd.charAt(7) - '0';
@@ -687,8 +763,8 @@ void checkDashboardControls() {
     mesh_print_status();
     ble_print_status();
     pushPerformanceMetrics();
-  } else {
-    Serial.printf("[CTRL] Unknown command '%s'. Commands: collision | kill A B | restore | status\n", cmd.c_str());
+  } else if (!ble_command(cmd)) {
+    Serial.printf("[CTRL] Unknown command '%s'. Commands: collision | kill A B | restore | status | ble | cal <id> <m> | setn <n>\n", cmd.c_str());
   }
 }
 
@@ -714,12 +790,10 @@ void cloudTask(void* param) {
   fbClient.setTimeout(2);
 
   static firebase_msg_t init;
-  for (int i = 1; i <= 3; i++) {
-    strcpy(init.method, "PUT");
-    snprintf(init.path, sizeof(init.path), "/nodes/N%d/status.json", i);
-    strcpy(init.payload, "\"inactive\"");
-    executeFirebase(init);
-  }
+  strcpy(init.method, "PATCH");
+  strcpy(init.path, "/.json");
+  strcpy(init.payload, "{\"nodes/N1/status\":\"inactive\",\"nodes/N2/status\":\"inactive\",\"nodes/N3/status\":\"inactive\"}");
+  executeFirebase(init);
 
   static firebase_msg_t msg;
   while (true) {
@@ -730,7 +804,7 @@ void cloudTask(void* param) {
     }
 
     // Poll /control.json for dashboard commands
-    if (millis() - lastControlPoll > 2500 && wifiConnected && !remote_cmd.pending) {
+    if (millis() - lastControlPoll > 3000 && wifiConnected && !remote_cmd.pending) {
       lastControlPoll = millis();
       String url = String(FIREBASE_HOST) + "/control.json";
       fbHttp.begin(fbClient, url);
@@ -795,6 +869,9 @@ void setup() {
   // 2. Wi-Fi FIRST (the AP decides the channel the whole mesh will use)
   connectWiFi();
 
+  // NTP time only orders dashboard history keys; the mesh does not depend on it
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
   // 3. ESP-NOW mesh on the same channel
   fbClient.setInsecure();
   fbClient.setTimeout(2);
@@ -857,10 +934,19 @@ void loop() {
   // 5. Commands
   checkDashboardControls();
 
+  // 6. One batched Firebase upload every 2 s
+  static uint32_t lastFbFlush = 0;
+  if (now - lastFbFlush >= FB_FLUSH_PERIOD_MS) {
+    lastFbFlush = now;
+    fb_flush();
+  }
+
   // 6. Status
   if (now - lastStatusPrint >= 15000) {
     lastStatusPrint = now;
     mesh_print_status();
+    Serial.printf("--- Gateway: Wi-Fi %s, free heap %u B, cloud batches skipped %lu ---\n",
+                  wifiConnected ? "connected" : "DISCONNECTED", (unsigned)ESP.getFreeHeap(), (unsigned long)fb_dropped);
     Serial.println("--- Sink Stats (unique packets per origin) ---");
     for (int i = 1; i <= 3; i++) {
       origin_stats_t& os = origin_stats[i];
