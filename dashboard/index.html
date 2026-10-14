@@ -51,6 +51,11 @@
         <span class="stat-label">Total Packets:</span>
         <span class="stat-val" id="total-packets">0</span>
       </div>
+      <div class="nav-divider"></div>
+      <div class="stat-item">
+        <span class="stat-label">Gateway N4:</span>
+        <span class="stat-val" id="gateway-status">waiting…</span>
+      </div>
     </div>
   </header>
 
@@ -167,7 +172,7 @@
 
         <!-- Ack Delay -->
         <div class="nq-card">
-          <div class="nq-card-label">Avg Ack Delay</div>
+          <div class="nq-card-label">Avg End-to-End Delay</div>
           <div class="nq-card-value-row">
             <span class="nq-card-value" id="nq-ack-val">—</span>
             <span class="nq-card-unit">ms</span>
@@ -210,8 +215,22 @@
             <span class="nq-card-value green" id="nq-duty-val">—</span>
             <span class="nq-card-unit">%</span>
           </div>
-          <div class="nq-card-breakdown">
+          <div class="nq-card-breakdown" id="nq-duty-breakdown">
             <span class="nq-chip">Active / Modem Sleep</span>
+          </div>
+        </div>
+
+        <!-- MAC activity (network-wide, from HELLO-reported counters) -->
+        <div class="nq-card">
+          <div class="nq-card-label">MAC Activity (CCA busy)</div>
+          <div class="nq-card-value-row">
+            <span class="nq-card-value amber" id="nq-mac-val">—</span>
+            <span class="nq-card-unit">events</span>
+          </div>
+          <div class="nq-card-breakdown" id="nq-mac-breakdown">
+            <span class="nq-chip">backoffs: —</span>
+            <span class="nq-chip">ACK timeouts: —</span>
+            <span class="nq-chip">drops: —</span>
           </div>
         </div>
       </div>
@@ -273,19 +292,15 @@
               </marker>
             </defs>
             <!-- Link lines (dynamically colored) -->
-            <line id="link-n1-n3" x1="60" y1="50" x2="160" y2="100" stroke="#00d2ff" stroke-width="2" stroke-dasharray="none" marker-end="url(#arrow)"/>
-            <line id="link-n2-n3" x1="60" y1="150" x2="160" y2="100" stroke="#00d2ff" stroke-width="2" stroke-dasharray="none" marker-end="url(#arrow)"/>
-            <line id="link-n3-n4" x1="160" y1="100" x2="260" y2="100" stroke="#00d2ff" stroke-width="2.5" marker-end="url(#arrow)"/>
-            <line id="link-n1-n4" x1="60" y1="50" x2="260" y2="100" stroke="rgba(255,255,255,0.08)" stroke-width="1.5" stroke-dasharray="4,4"/>
-            <line id="link-n2-n4" x1="60" y1="150" x2="260" y2="100" stroke="rgba(255,255,255,0.08)" stroke-width="1.5" stroke-dasharray="4,4"/>
+            <g id="topo-edges"><!-- drawn by dashboard.js from the next hops reported in HELLOs --></g>
 
             <!-- Node Circles -->
             <g transform="translate(60, 50)">
-              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2"/>
+              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2" id="node-n1-circle"/>
               <text text-anchor="middle" dy="4" fill="#fff" font-size="10" font-weight="700" font-family="'JetBrains Mono'">N1</text>
             </g>
             <g transform="translate(60, 150)">
-              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2"/>
+              <circle r="16" fill="#090e1a" stroke="#00d2ff" stroke-width="2" id="node-n2-circle"/>
               <text text-anchor="middle" dy="4" fill="#fff" font-size="10" font-weight="700" font-family="'JetBrains Mono'">N2</text>
             </g>
             <g transform="translate(160, 100)">
@@ -322,7 +337,7 @@
         </div>
         <div class="agg-reduction-banner">
           <div class="agg-val-huge" id="agg-reduction-val">0.0%</div>
-          <div class="agg-val-sub">Payload Bandwidth Reduction</div>
+          <div class="agg-val-sub">Cumulative byte reduction · window <span id="agg-window-red">—</span> · packets <span id="agg-pkt-red">—</span></div>
           <div class="agg-meter-bg">
             <div class="agg-meter-fill" id="agg-meter-fill"></div>
           </div>
@@ -373,6 +388,28 @@
             <span>N3 (Cluster):</span>
             <span class="val" id="ble-n3-pos">est=(—, —) err=—m</span>
           </div>
+          <div class="ble-table-row">
+            <span>N4 (Sink):</span>
+            <span class="val" id="ble-n4-pos">est=(—, —) err=—m</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4. TDMA SCHEDULE (dynamic) -->
+      <div class="mi-card" style="grid-column: 1 / -1;">
+        <div class="mi-header">
+          <span class="mi-title">Dynamic TDMA Schedule (superframe 800 ms)</span>
+          <span class="nq-chip" id="tdma-version-chip">v— by —</span>
+        </div>
+        <div class="topo-list">
+          <div class="topo-row"><span class="topo-route">BEACON 0–40 ms</span><span class="topo-badge badge-alive">N4 sync beacon</span></div>
+          <div class="topo-row"><span class="topo-route">CAP 40–160 ms</span><span class="topo-badge badge-alive">contention: HELLO / schedule / retries</span></div>
+          <div class="topo-row"><span class="topo-route">S1 160–280 ms</span><span class="topo-badge" id="tdma-s1">—</span></div>
+          <div class="topo-row"><span class="topo-route">S2 280–400 ms</span><span class="topo-badge" id="tdma-s2">—</span></div>
+          <div class="topo-row"><span class="topo-route">S3 400–550 ms</span><span class="topo-badge" id="tdma-s3">—</span></div>
+          <div class="topo-row"><span class="topo-route">S4 550–670 ms</span><span class="topo-badge" id="tdma-s4">—</span></div>
+          <div class="topo-row"><span class="topo-route">SLEEP 670–800 ms</span><span class="topo-badge badge-dead">no Wi-Fi TX · BLE scan</span></div>
+          <div class="topo-row"><span class="topo-route">Last update reason:</span><span class="topo-route" id="tdma-reason">—</span></div>
         </div>
       </div>
     </section>
