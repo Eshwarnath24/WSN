@@ -25,6 +25,9 @@
   #error "Define MY_NODE_ID (1, 2, 3, or 4) before including wsn_common.h"
 #endif
 
+// Printed at boot on every node: check that all 4 boards show the SAME version.
+#define WSN_FW_VERSION "WSN-FW 2.2 (readable logs, slot-safe TX)"
+
 // ==================== NETWORK CONSTANTS ====================
 #define NUM_NODES             4
 #define SINK_ID               4
@@ -560,7 +563,25 @@ inline const char* epochStr(uint8_t e) {
   return (e <= EPOCH_SLEEP) ? names[e] : "?";
 }
 
+// ==================== TIME HELPERS ====================
+// Age of a timestamp that ANOTHER TASK may have just written (Wi-Fi / BLE
+// callbacks). With "now" sampled earlier, plain (now - t) wraps to ~4.29e9 ms
+// when t is a few ms in the future: on hardware this caused false "sync lost",
+// false BLE "expired", false link timeouts and nodes flagged INACTIVE.
+inline uint32_t wsn_age_ms(uint32_t t) {
+  int32_t d = (int32_t)(millis() - t);
+  return (d > 0) ? (uint32_t)d : 0;
+}
+
+// ==================== LOGGING ====================
+extern uint8_t  wsn_log_level;
+extern uint32_t wsn_log_force_until;
+inline bool wsn_verbose() { return wsn_log_level >= 2 || (int32_t)(wsn_log_force_until - millis()) > 0; }
+#define LOGV(...) do { if (wsn_verbose()) Serial.printf(__VA_ARGS__); } while (0)                       // per-packet trace
+#define LOGE(...) do { if (wsn_log_level >= 1 || wsn_verbose()) Serial.printf(__VA_ARGS__); } while (0) // events
+
 inline void logPacket(const char* dir, const wsn_packet_t& p) {
+  if (!wsn_verbose()) return;
   Serial.printf("[%s] type=%-9s src=N%d dst=%-5s origin=N%d final=%s seq=%d hops=%d ttl=%d len=%d\n",
     dir, msgTypeStr(p.msg_type),
     p.src_id, nodeIdStr(p.dst_id),

@@ -15,6 +15,7 @@
 // ====================================================================
 
 #define MY_NODE_ID 4
+#pragma GCC optimize("Os")   // shrink binary; safe on ESP32 (no timing-critical ISRs here)
 #if __has_include("wsn_common.h")
 #include "wsn_common.h"
 #include "wsn_mesh.h"
@@ -27,7 +28,6 @@
 
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <time.h>
 
 // Wi-Fi / Firebase credentials live in wsn_config.h (keep it out of Git).
 #if __has_include("wsn_config.h")
@@ -41,18 +41,18 @@ const char* WIFI_PASS     = WSN_WIFI_PASS;
 const char* FIREBASE_HOST = WSN_FIREBASE_HOST;
 
 #define WIFI_TIMEOUT_ATTEMPTS 20
-#define FIREBASE_QUEUE_SIZE   3       // batches waiting for upload
-#define FB_PAYLOAD_SIZE       3700    // one batched multi-path PATCH
-#define FB_BATCH_SIZE         3600
-#define FB_FLUSH_PERIOD_MS    2000    // one HTTPS request every 2 s instead of ~4 per second
+#define FIREBASE_QUEUE_SIZE   5       // keep small: each entry holds FB_PAYLOAD_SIZE bytes of heap
+#define FB_PAYLOAD_SIZE       1536    // 5x1536=7.5KB queue RAM vs 8x2048=16KB — saves ~8KB heap
+#define FB_BATCH_SIZE         1500    // rolling batch buffer
+#define FB_FLUSH_PERIOD_MS    3000    // one HTTPS request every 3 s (TLS handshake takes 1-3 s)
 #define NODE_ACTIVE_TIMEOUT_MS 8000
 #define N3_SILENT_MS          10000
-#define METRICS_PERIOD_MS     5000
-#define DATA_PUSH_MIN_MS      1000
+#define METRICS_PERIOD_MS     10000  // push performance metrics every 10 s (was 5 s, too frequent)
+#define DATA_PUSH_MIN_MS      2000   // min 2 s between per-node Firebase pushes (was 1 s)
 
 // ==================== FIREBASE CLIENT ====================
-WiFiClientSecure fbClient;
-HTTPClient fbHttp;
+WiFiClientSecure fbClient;   // TLS required for firebasedatabase.app (HTTPS-only)
+HTTPClient       fbHttp;
 volatile bool wifiConnected = false;
 
 // ==================== REMOTE DASHBOARD COMMANDS ====================
@@ -119,28 +119,26 @@ uint32_t lastFailoverCheck = 0;
 // ==================== FIREBASE HELPERS ====================
 
 void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    return;
-  }
-  Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
+  if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; return; }
+  // Reset any stuck connecting state — this prevents:
+  // "E: wifi:sta is connecting, cannot set config"
+  WiFi.disconnect(true);          // drop current connection attempt
+  delay(100);                     // let driver settle
   WiFi.mode(WIFI_STA);
+  Serial.printf_P(PSTR("[WiFi] Connecting to %s ...\n"), WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < WIFI_TIMEOUT_ATTEMPTS) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+    delay(500); Serial.print('.'); attempts++;
   }
-
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    Serial.printf("\n[WiFi] CONNECTED | IP=%s | Channel=%d (ESP-NOW mesh uses this channel)\n",
-                  WiFi.localIP().toString().c_str(), WiFi.channel());
+    Serial.printf_P(PSTR("\n[WiFi] CONNECTED IP=%s ch=%d\n"),
+                    WiFi.localIP().toString().c_str(), WiFi.channel());
   } else {
     wifiConnected = false;
-    Serial.printf("\n[WiFi] FAILED (status=%d) — mesh runs, cloud upload disabled until reconnect\n", WiFi.status());
+    WiFi.disconnect(true);        // leave driver idle, not stuck-connecting
+    Serial.printf_P(PSTR("\n[WiFi] FAILED(%d) — mesh OK, retry in 30 s\n"), WiFi.status());
   }
 }
 
@@ -154,14 +152,10 @@ static int  fb_batch_len = 0;
 static uint32_t fb_dropped = 0;
 
 void fb_key(char* out, size_t n) {
+  // millis()-based key with counter: unique within a session, no NTP needed
   static uint8_t ctr = 0;
-  time_t t = time(nullptr);
   ctr = (ctr + 1) % 100;
-  if (t > 1700000000) {
-    snprintf(out, n, "t%010lu%03u%02u", (unsigned long)t, (unsigned)(millis() % 1000), ctr);
-  } else {
-    snprintf(out, n, "m%010lu%02u", (unsigned long)millis(), ctr);  // before NTP sync
-  }
+  snprintf(out, n, "m%010lu%02u", (unsigned long)millis(), ctr);
 }
 
 void fb_flush() {
@@ -172,8 +166,8 @@ void fb_flush() {
   snprintf(msg.payload, sizeof(msg.payload), "{%s}", fb_batch);
   if (xQueueSend(firebaseQueue, &msg, 0) != pdTRUE) {
     fb_dropped++;
-    Serial.printf("[Firebase] Upload still busy — batch of %d B skipped (total skipped %lu)\n",
-                  fb_batch_len, (unsigned long)fb_dropped);
+    Serial.printf_P(PSTR("[Firebase] busy—batch %dB skipped (dropped=%lu)\n"),
+                    fb_batch_len, (unsigned long)fb_dropped);
   }
   fb_batch_len = 0;
   fb_batch[0] = '\0';
@@ -230,14 +224,14 @@ void queueFirebase(const char* method, const char* path, const char* payload) {
   fb_append(rel, payload);
 }
 
-// Execute a Firebase HTTP request (called from cloudTask)
+// Execute a Firebase HTTPS request (called from cloudTask)
 bool executeFirebase(const firebase_msg_t& msg) {
   if (!wifiConnected || WiFi.status() != WL_CONNECTED) return false;
   String url = String(FIREBASE_HOST) + msg.path;
   for (int attempt = 0; attempt < 2; attempt++) {
     fbHttp.begin(fbClient, url);
     fbHttp.setReuse(true);
-    fbHttp.setTimeout(5000);   // TLS handshake on ESP32 can take 1–3 s
+    fbHttp.setTimeout(5000);  // TLS handshake can take 1-3 s on ESP32
     fbHttp.addHeader("Content-Type", "application/json");
     int code = 0;
     if (strcmp(msg.method, "POST") == 0)       code = fbHttp.POST(msg.payload);
@@ -245,11 +239,10 @@ bool executeFirebase(const firebase_msg_t& msg) {
     else                                       code = fbHttp.PUT(msg.payload);
     fbHttp.end();
     if (code > 0 && code < 400) return true;
-    Serial.printf("[Cloud] HTTP %s %s → code %d (%s), free heap %u B, payload %u B\n",
-                  msg.method, msg.path, code, code < 0 ? "connection/TLS error" : "server rejected",
-                  (unsigned)ESP.getFreeHeap(), (unsigned)strlen(msg.payload));
+    Serial.printf_P(PSTR("[Cloud] HTTP %s %s code=%d heap=%u\n"),
+                    msg.method, msg.path, code, (unsigned)ESP.getFreeHeap());
     fbClient.stop();
-    if (attempt == 0) delay(200);
+    if (attempt == 0) delay(300);
   }
   return false;
 }
@@ -343,10 +336,10 @@ void processSensorData(const wsn_packet_t& pkt, int rssi) {
   note_delivered_bytes(pkt);
 
   bool colltest = strncmp(sp.sensor_type, "colltest", sizeof(sp.sensor_type)) == 0;
-  Serial.printf("[SINK] DATA from N%d: v1=%.2f v2=%.2f v3=%.2f sensor=%s seq=%d hops=%d route=%s delay=%ld ms RSSI(last hop)=%d\n",
+  Serial.printf_P(PSTR("[SINK] DATA N%d v1=%.2f v2=%.2f v3=%.2f t=%s seq=%d hops=%d rt=%s dly=%ldms RSSI=%d\n"),
     oid, sp.val1, sp.val2, sp.val3, sp.sensor_type, pkt.seq_num, pkt.hop_count, route, (long)delay, rssi);
   if (colltest) {
-    Serial.println("[SINK] Collision-test frame delivered (counted for PDR, excluded from sensor charts)");
+    Serial.println(F("[SINK] Collision-test frame delivered"));
     return;
   }
   push_node_data(oid, sp.sensor_type, pkt.seq_num, sp.val1, sp.val2, sp.val3,
@@ -388,30 +381,26 @@ void processAggData(const wsn_packet_t& pkt, int rssi) {
   portEXIT_CRITICAL(&sink_mux);
   float win_red = ap.win_bytes_in ? (1.0f - (float)ap.win_bytes_out / ap.win_bytes_in) * 100.0f : 0;
 
-  Serial.printf("[SINK] AGG from N%d seq=%d route=%s: N1[%d] mean=(%.2f,%.2f,%.2f) max=%.2f | N2[%d] flame max=%.0f min=%.0f DO=%d | N3 IR=%d\n",
+  Serial.printf_P(PSTR("[SINK] AGG N%d seq=%d via %s: N1[%d](%.2f,%.2f,%.2f)max=%.2f N2[%d]fl=%.0f/%d N3IR=%d\n"),
     pkt.origin_id, pkt.seq_num, route, ap.n1_count, ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z,
-    ap.n1_accel_max, ap.n2_count, ap.n2_flame_analog_max, ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n3_ir_obstacle);
-  Serial.printf("[SINK] AGG reduction: window %u B→%u B (%.1f%%) | cumulative bytes %.1f%%, packets %lu→%lu (%.1f%%) | delay N3=%ld ms, N1(oldest)=%ld ms, N2(oldest)=%ld ms (-1 = no reading)\n",
+    ap.n1_accel_max, ap.n2_count, ap.n2_flame_analog_max, ap.n2_flame_digital, ap.n3_ir_obstacle);
+  Serial.printf_P(PSTR("[SINK] AGG red: %uB→%uB(%.1f%%) cum=%.1f%% pkts %lu→%lu(%.1f%%) dly N3=%ldms N1=%ldms N2=%ldms\n"),
     ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red,
     (unsigned long)agg_pkts_in_total, (unsigned long)agg_pkts_out_total, pkt_red, (long)d3, (long)d1, (long)d2);
 
-  // Dashboard: aggregation card
+  // Dashboard: aggregation card (compact payload to save flash)
   static uint32_t lastAggPush = 0;
   if (millis() - lastAggPush >= DATA_PUSH_MIN_MS) {
     lastAggPush = millis();
-    char payload[FB_PAYLOAD_SIZE];
+    char payload[512];
     snprintf(payload, sizeof(payload),
-      "{\"n1_mean_x\":%.2f,\"n1_mean_y\":%.2f,\"n1_mean_z\":%.2f,\"n1_max\":%.2f,\"n1_count\":%u,"
-      "\"n2_flame_max\":%.0f,\"n2_flame_min\":%.0f,\"n2_flame_digital\":%u,\"n2_count\":%u,\"n3_ir\":%u,"
-      "\"n1_seq\":\"%u-%u\",\"n2_seq\":\"%u-%u\","
-      "\"bytes_in\":%u,\"bytes_out\":%u,\"reduction_pct\":%.1f,"
-      "\"cum_reduction_pct\":%.1f,\"pkt_reduction_pct\":%.1f,\"pkts_in\":%lu,\"pkts_out\":%lu,"
-      "\"hops\":%u,\"route\":\"%s\",\"timestamp\":%lu}",
+      "{\"n1x\":%.2f,\"n1y\":%.2f,\"n1z\":%.2f,\"n1max\":%.2f,\"n1c\":%u,"
+      "\"n2max\":%.0f,\"n2min\":%.0f,\"n2d\":%u,\"n2c\":%u,\"n3ir\":%u,"
+      "\"bin\":%u,\"bout\":%u,\"red\":%.1f,\"cred\":%.1f,\"pred\":%.1f,"
+      "\"hops\":%u,\"rt\":\"%s\",\"ts\":%lu}",
       ap.n1_accel_mean_x, ap.n1_accel_mean_y, ap.n1_accel_mean_z, ap.n1_accel_max, ap.n1_count,
       ap.n2_flame_analog_max, ap.n2_flame_analog_min, ap.n2_flame_digital, ap.n2_count, ap.n3_ir_obstacle,
-      ap.n1_seq_start, ap.n1_seq_end, ap.n2_seq_start, ap.n2_seq_end,
       ap.win_bytes_in, ap.win_bytes_out, win_red, cum_red, pkt_red,
-      (unsigned long)agg_pkts_in_total, (unsigned long)agg_pkts_out_total,
       pkt.hop_count + 1, route, (unsigned long)millis());
     queueFirebase("POST", "/agg/data.json", payload);
   }
@@ -463,14 +452,26 @@ void localizeReport(const ble_report_payload_t& rpt) {
   }
   if (ok) {
     loc_error[id] = err;
-    Serial.printf("[SINK] Localization N%d: est=(%.2f,%.2f) reference=(%.2f,%.2f) error=%.2f m | range residual %.2f m (%s) | nearest=N%d\n",
+    Serial.printf("[SINK] Localization N%d: est=(%.2f,%.2f) true=(%.2f,%.2f) error=%.2f m | residual=%.2f m (%s) | nearest=N%d\n",
                   id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rms,
-                  rms < 1.0f ? "good" : (rms < 3.0f ? "fair" : "poor: calibrate"), rpt.nearest_node_id);
+                  rms < 1.0f ? "good" : (rms < 3.0f ? "fair" : "poor: calibrate TxPower"), rpt.nearest_node_id);
+  } else if (rpt.num_neighbors == 2) {
+    // 2-anchor fallback: weighted midpoint along the line between the two anchors
+    // weight_i = 1/d_i^2 (closer anchor counts more)
+    float w0 = (dists[0] > 0.01f) ? 1.0f / (dists[0] * dists[0]) : 100.0f;
+    float w1 = (dists[1] > 0.01f) ? 1.0f / (dists[1] * dists[1]) : 100.0f;
+    float wt = w0 + w1;
+    ex = (w1 * NODE_TRUE_POS[ids[0]][0] + w0 * NODE_TRUE_POS[ids[1]][0]) / wt;
+    ey = (w1 * NODE_TRUE_POS[ids[0]][1] + w0 * NODE_TRUE_POS[ids[1]][1]) / wt;
+    err = sqrtf(powf(ex - NODE_TRUE_POS[id][0], 2) + powf(ey - NODE_TRUE_POS[id][1], 2));
+    loc_error[id] = err;
+    Serial.printf("[SINK] Localization N%d: 2-anchor weighted-proximity est=(%.2f,%.2f) true=(%.2f,%.2f) error=%.2f m | nearest=N%d (need 3 anchors for full trilateration)\n",
+                  id, ex, ey, NODE_TRUE_POS[id][0], NODE_TRUE_POS[id][1], err, rpt.nearest_node_id);
   } else {
-    Serial.printf("[SINK] Localization N%d: proximity only (%d anchors) | nearest=N%d\n",
+    Serial.printf("[SINK] Localization N%d: only %d anchor(s) visible — nearest=N%d (need ≥2 for estimate, 3 for trilateration)\n",
                   id, rpt.num_neighbors, rpt.nearest_node_id);
   }
-  pushLocalization(id, rpt, ok, ex, ey, err);
+  pushLocalization(id, rpt, ok || rpt.num_neighbors == 2, ex, ey, err);
 }
 
 void processBleReport(const wsn_packet_t& pkt) {
@@ -519,7 +520,7 @@ bool app_on_data_transit(const wsn_packet_t& pkt, int rssi) {
 
 // ==================== METRICS → FIREBASE ====================
 
-bool recently(uint32_t t, uint32_t window) { return t != 0 && millis() - t < window; }
+bool recently(uint32_t t, uint32_t window) { return t != 0 && wsn_age_ms(t) < window; }
 
 // Next hop of a node: from its own HELLO while N4 hears it directly,
 // otherwise from the most recent observed hop trace ("N3→N2→N4" → N2).
@@ -588,56 +589,31 @@ void pushPerformanceMetrics() {
     loc_n ? loc_sum / loc_n : -1.0f, (unsigned long)now);
   queueFirebase("PATCH", "/.json", body);
 
-  Serial.printf("[PERF] PDR=%.1f%% (%lu/%lu) loss=%.1f%% avg_delay=%.1f ms throughput=%.3f kbps goodput=%.3f kbps retransmissions=%lu reduction=%.1f%% bytes/%.1f%% pkts avg_loc_err=%.2f m\n",
-    net_pdr, (unsigned long)tot_rx, (unsigned long)tot_exp, tot_exp ? 100.0f - net_pdr : 0, net_delay, kbps, goodput,
+  Serial.printf_P(PSTR("[PERF] PDR=%.1f%%(%lu/%lu) dly=%.1fms tp=%.3fkbps ret=%lu red=%.1f%%B/%.1f%%pkt locerr=%.2fm\n"),
+    net_pdr, (unsigned long)tot_rx, (unsigned long)tot_exp, net_delay, kbps,
     (unsigned long)net_retx, cum_red, pkt_red, loc_n ? loc_sum / loc_n : -1.0f);
 
-  // ---- Part 2: MAC activity, duty cycle, topology ----
-  uint32_t net_cca = mesh.mac_stats.cca_busy_count, net_bo = mesh.mac_stats.total_backoffs;
-  uint32_t net_to = mesh.mac_stats.total_acks_timeout, net_drop = mesh.mac_stats.total_drops;
-  for (int i = 1; i <= 3; i++) {
-    net_cca += mesh.neighbors[i].reported_cca_busy;
-    net_bo += mesh.neighbors[i].reported_backoffs;
-    net_to += mesh.neighbors[i].reported_ack_timeouts;
-    net_drop += mesh.neighbors[i].reported_drops;
-  }
+  // ---- Part 2: compact MAC + topology push ----
+  uint32_t net_cca = mesh.mac_stats.cca_busy_count + mesh.neighbors[1].reported_cca_busy
+                     + mesh.neighbors[2].reported_cca_busy + mesh.neighbors[3].reported_cca_busy;
+  uint32_t net_retries2 = mesh.mac_stats.total_retries + mesh.neighbors[1].reported_retries
+                          + mesh.neighbors[2].reported_retries + mesh.neighbors[3].reported_retries;
   uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
   float duty4 = total ? mesh.tdma.active_time_ms * 100.0f / total : 100.0f;
   float duty_sum = 0; int duty_n = 0;
   for (int i = 1; i <= 3; i++) if (recently(mesh.neighbors[i].last_hello_ms, HELLO_TIMEOUT_MS)) { duty_sum += mesh.neighbors[i].reported_duty_pct; duty_n++; }
-
-  bool n3_link = mesh.neighbors[3].link_alive;
+  // Single compact PATCH combining MAC + duty + topology
   len = snprintf(body, sizeof(body),
-    "{\"perf/throughput\":{\"kbps\":%.3f,\"goodput_kbps\":%.3f,\"window_ms\":%lu,\"timestamp\":%lu},"
-    "\"perf/mac\":{\"cca_busy\":%lu,\"backoffs\":%lu,\"retries\":%lu,\"network_retries\":%lu,"
-    "\"network_cca_busy\":%lu,\"network_backoffs\":%lu,\"network_ack_timeouts\":%lu,\"network_drops\":%lu,"
-    "\"drops\":%lu,\"acks_ok\":%lu,\"acks_timeout\":%lu,\"dup_rx\":%lu},",
-    kbps, goodput, (unsigned long)elapsed, (unsigned long)now,
-    (unsigned long)mesh.mac_stats.cca_busy_count, (unsigned long)mesh.mac_stats.total_backoffs,
-    (unsigned long)mesh.mac_stats.total_retries, (unsigned long)net_retx,
-    (unsigned long)net_cca, (unsigned long)net_bo, (unsigned long)net_to, (unsigned long)net_drop,
-    (unsigned long)mesh.mac_stats.total_drops, (unsigned long)mesh.mac_stats.total_acks_ok,
-    (unsigned long)mesh.mac_stats.total_acks_timeout, (unsigned long)mesh.mac_stats.dup_rx);
-  len += snprintf(body + len, sizeof(body) - len, "\"perf/mac_nodes\":{");
-  for (int i = 1; i <= 3; i++) {
-    route_neighbor_t& nb = mesh.neighbors[i];
-    len += snprintf(body + len, sizeof(body) - len,
-      "%s\"N%d\":{\"retries\":%u,\"cca_busy\":%u,\"backoffs\":%u,\"ack_timeouts\":%u,\"drops\":%u,\"duty_pct\":%u}",
-      i > 1 ? "," : "", i, nb.reported_retries, nb.reported_cca_busy, nb.reported_backoffs,
-      nb.reported_ack_timeouts, nb.reported_drops, nb.reported_duty_pct);
-  }
-  len += snprintf(body + len, sizeof(body) - len,
-    "},\"perf/duty_cycle\":{\"duty_cycle_pct\":%.1f,\"sink_duty_pct\":%.1f,\"active_ms\":%lu,\"sleep_ms\":%lu,\"timestamp\":%lu},",
-    duty_n ? duty_sum / duty_n : duty4, duty4, (unsigned long)mesh.tdma.active_time_ms,
-    (unsigned long)mesh.tdma.sleep_time_ms, (unsigned long)now);
-  len += snprintf(body + len, sizeof(body) - len,
-    "\"route/topology\":{\"N1_next\":\"%s\",\"N2_next\":\"%s\",\"N3_next\":\"%s\","
-    "\"N1_alive\":%s,\"N2_alive\":%s,\"N3_alive\":%s,\"N3_N4_link\":%s,"
-    "\"N1_path\":\"%s\",\"N2_path\":\"%s\",\"N3_path\":\"%s\",\"scheduler\":\"N%d\",\"timestamp\":%lu}}",
+    "{\"perf/mac\":{\"cca\":%lu,\"retries\":%lu,\"acks_ok\":%lu,\"drops\":%lu,\"dup\":%lu},"
+    "\"perf/duty\":{\"avg_pct\":%.1f,\"sink_pct\":%.1f,\"ts\":%lu},"
+    "\"route/topo\":{\"N1_nh\":\"%s\",\"N2_nh\":\"%s\",\"N3_nh\":\"%s\","
+    "\"N1_ok\":%s,\"N2_ok\":%s,\"N3_ok\":%s,\"sched\":N%d,\"ts\":%lu}}",
+    (unsigned long)net_cca, (unsigned long)net_retries2,
+    (unsigned long)mesh.mac_stats.total_acks_ok, (unsigned long)mesh.mac_stats.total_drops,
+    (unsigned long)mesh.mac_stats.dup_rx,
+    duty_n ? duty_sum / duty_n : duty4, duty4, (unsigned long)now,
     nextHopName(1, snap[1].last_path), nextHopName(2, snap[2].last_path), nextHopName(3, snap[3].last_path),
     node_active[1] ? "true" : "false", node_active[2] ? "true" : "false", node_active[3] ? "true" : "false",
-    n3_link ? "true" : "false",
-    snap[1].last_path, snap[2].last_path, snap[3].last_path,
     mesh.tdma.sched_issuer ? mesh.tdma.sched_issuer : 3, (unsigned long)now);
   queueFirebase("PATCH", "/.json", body);
 }
@@ -682,17 +658,17 @@ void nodeWatchdog() {
 // N4 takes over TDMA scheduling if the cluster head (N3) is silent
 void checkSchedulerFailover() {
   uint32_t n3_last = max(last_activity_ms[3], mesh.last_heard_ms[3]);
-  bool n3_silent = (n3_last == 0) ? (millis() > 30000) : (millis() - n3_last > N3_SILENT_MS);
+  bool n3_silent = (n3_last == 0) ? (millis() > 30000) : (wsn_age_ms(n3_last) > N3_SILENT_MS);
   bool primary_stale = mesh.tdma.last_primary_sched_ms == 0 ||
-                       millis() - mesh.tdma.last_primary_sched_ms > SCHED_PRIMARY_TIMEOUT_MS;
+                       wsn_age_ms(mesh.tdma.last_primary_sched_ms) > SCHED_PRIMARY_TIMEOUT_MS;
 
   if (n3_silent && primary_stale) {
     bool n1 = mesh.neighbors[1].link_alive || recently(last_activity_ms[1], NODE_ACTIVE_TIMEOUT_MS);
     bool n2 = mesh.neighbors[2].link_alive || recently(last_activity_ms[2], NODE_ACTIVE_TIMEOUT_MS);
     if (!failoverActive || n1 != failN1 || n2 != failN2) {
       if (!failoverActive) {
-        Serial.printf("[N4] *** N3 silent for %lu ms — N4 takes over TDMA scheduling ***\n",
-                      (unsigned long)(n3_last ? millis() - n3_last : millis()));
+        Serial.printf_P(PSTR("[N4] N3 silent %lums — failover\n"),
+                      (unsigned long)(n3_last ? wsn_age_ms(n3_last) : millis()));
       }
       failoverActive = true;
       failN1 = n1; failN2 = n2;
@@ -703,7 +679,7 @@ void checkSchedulerFailover() {
   } else if (failoverActive && !n3_silent) {
     failoverActive = false;
     mesh.sched_is_coordinator = false;
-    Serial.println("[N4] N3 is back — schedule control returned to the cluster head");
+    Serial.println(F("[N4] N3 back—schedule returned"));
   }
 }
 
@@ -729,25 +705,28 @@ void checkDashboardControls() {
     p1 = remote_cmd.p1;
     p2 = remote_cmd.p2;
     remote_cmd.pending = false;
-    Serial.printf("[CTRL-REMOTE] Executing dashboard command: %s (p1=%d p2=%d)\n", cmd.c_str(), p1, p2);
+    Serial.printf_P(PSTR("[CTRL-R] %s p1=%d p2=%d\n"), cmd.c_str(), p1, p2);
   } else if (wsn_read_serial_line(cmd)) {
     if (cmd.startsWith("kill ") && cmd.length() >= 8) {
       p1 = cmd.charAt(5) - '0';
       p2 = cmd.charAt(7) - '0';
       cmd = "kill";
+    } else if (cmd.startsWith("log ") && cmd.length() >= 5) {
+      p1 = cmd.charAt(4) - '0';
+      cmd = "log";
     }
   }
   if (cmd.length() == 0) return;
 
   if (cmd == "collision") {
-    Serial.println("[CTRL] Broadcasting COLLISION_TEST (N1+N2 contend at next CAP)");
+    Serial.println(F("[CTRL] COLLISION_TEST broadcast"));
     broadcastCtrl(CTRL_COLLISION_TEST, 0, 0);
   } else if (cmd == "kill") {
     if (p1 < 1 || p1 > NUM_NODES || p2 < 1 || p2 > NUM_NODES || p1 == p2) {
-      Serial.println("[CTRL] Usage: kill <a> <b>   e.g. kill 3 4");
+      Serial.println(F("[CTRL] Usage: kill a b"));
       return;
     }
-    Serial.printf("[CTRL] Broadcasting KILL_LINK N%d↔N%d (software failure injection)\n", p1, p2);
+    Serial.printf_P(PSTR("[CTRL] KILL N%d↔N%d\n"), p1, p2);
     broadcastCtrl(CTRL_KILL_LINK, (uint8_t)p1, (uint8_t)p2);
     if (p1 == SINK_ID || p2 == SINK_ID) {
       uint8_t other = (p1 == SINK_ID) ? p2 : p1;
@@ -755,16 +734,22 @@ void checkDashboardControls() {
       mesh.killed_links[other] = true;
     }
   } else if (cmd == "restore") {
-    Serial.println("[CTRL] Broadcasting RESTORE_LINKS");
+    Serial.println(F("[CTRL] RESTORE broadcast"));
     broadcastCtrl(CTRL_RESTORE_LINKS, 0, 0);
     for (int i = 1; i <= NUM_NODES; i++) mesh.killed_links[i] = false;
     mesh.hello_triggered = true;
   } else if (cmd == "status") {
     mesh_print_status();
     ble_print_status();
-    pushPerformanceMetrics();
+  } else if (cmd == "log") {
+    if (p1 >= 0 && p1 <= 2) {
+      wsn_log_level = (uint8_t)p1;
+      Serial.printf_P(PSTR("[LOG] Level=%d\n"), wsn_log_level);
+    } else {
+      Serial.println(F("[LOG] Usage: log <0|1|2>"));
+    }
   } else if (!ble_command(cmd)) {
-    Serial.printf("[CTRL] Unknown command '%s'. Commands: collision | kill A B | restore | status | ble | cal <id> <m> | setn <n>\n", cmd.c_str());
+    Serial.println(F("[CTRL] Cmds: collision|kill A B|restore|status|log 0-2|ble|cal"));
   }
 }
 
@@ -785,9 +770,9 @@ bool jsonCmd(const String& resp, char* out, size_t n) {
 // ==================== FreeRTOS TASKS ====================
 
 void cloudTask(void* param) {
-  Serial.println("[Cloud] Task started on Core 0");
-  fbClient.setInsecure();
-  fbClient.setTimeout(2);
+  Serial.println(F("[Cloud] Task started on Core 0"));
+  fbClient.setInsecure();   // skip cert check (self-signed / firebase cert)
+  fbClient.setTimeout(5);  // 5 s TLS handshake timeout
 
   static firebase_msg_t init;
   strcpy(init.method, "PATCH");
@@ -832,18 +817,24 @@ void cloudTask(void* param) {
       fbHttp.end();
     }
 
-    // Wi-Fi watchdog
-    if (millis() - lastWifiCheck > 10000) {
+    // Wi-Fi watchdog: 30 s between reconnect attempts to avoid
+    // flooding the radio (which starves ESP-NOW when WiFi is down)
+    if (millis() - lastWifiCheck > 30000) {
       lastWifiCheck = millis();
       if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-        Serial.println("[WiFi] Connection LOST");
+        Serial.println(F("[WiFi] Lost — draining Firebase queue"));
         wifiConnected = false;
         fbClient.stop();
+        // Drain queue + batch so stale data doesn't fill memory
+        { firebase_msg_t tmp;
+          while (xQueueReceive(firebaseQueue, &tmp, 0) == pdTRUE) fb_dropped++; }
+        fb_batch_len = 0; fb_batch[0] = '\0';
       } else if (WiFi.status() != WL_CONNECTED) {
-        connectWiFi();
+        connectWiFi();   // attempt reconnect (includes disconnect+reset inside)
       } else if (!wifiConnected) {
         wifiConnected = true;
-        fbClient.stop();
+        fbClient.stop(); // fresh TLS session after reconnect
+        Serial.println(F("[WiFi] Reconnected — resuming Firebase"));
       }
     }
 
@@ -857,6 +848,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 4 (Sink / Gateway) BOOTING =====");
+  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   memset(origin_stats, 0, sizeof(origin_stats));
   firebaseQueue = xQueueCreate(FIREBASE_QUEUE_SIZE, sizeof(firebase_msg_t));
@@ -868,13 +860,11 @@ void setup() {
 
   // 2. Wi-Fi FIRST (the AP decides the channel the whole mesh will use)
   connectWiFi();
+  if (wifiConnected) {
+    Serial.printf_P(PSTR("[N4] WiFi channel=%d — ESP-NOW mesh will use this channel\n"), WiFi.channel());
+  }
 
-  // NTP time only orders dashboard history keys; the mesh does not depend on it
-  configTime(0, 0, "pool.ntp.org", "time.google.com");
-
-  // 3. ESP-NOW mesh on the same channel
-  fbClient.setInsecure();
-  fbClient.setTimeout(2);
+  // 3. ESP-NOW mesh init (uses WiFi channel set above)
   mesh_init();
 
   // 4. N4 is the time reference and routing root
@@ -886,11 +876,11 @@ void setup() {
   mesh.next_hop_to_sink = SINK_ID;
   last_metrics_ms = millis();
 
-  // 5. Cloud uploads on core 0
+  // 5. Cloud uploads on core 0 (TLS/WiFiClientSecure needs ~11 KB stack)
   xTaskCreatePinnedToCore(cloudTask, "cloudTask", 12288, NULL, 1, NULL, 0);
 
-  Serial.println("===== N4 SETUP COMPLETE =====\n");
-  Serial.println("Serial commands: 'collision', 'kill X Y', 'restore', 'status'");
+  Serial.println(F("===== N4 SETUP COMPLETE ====="));
+  Serial.println(F("Cmds: collision|kill X Y|restore|status|log 0-2"));
 }
 
 // ==================== MAIN LOOP ====================
@@ -912,7 +902,7 @@ void loop() {
     lastBleReport = now;
     ble_report_payload_t rpt = ble_build_report();
     if (rpt.num_neighbors > 0) {
-      Serial.println("[SINK] BLE self-report (N4):");
+      Serial.println(F("[SINK] BLE self-report (N4):"));
       localizeReport(rpt);
     }
   }
@@ -945,9 +935,9 @@ void loop() {
   if (now - lastStatusPrint >= 15000) {
     lastStatusPrint = now;
     mesh_print_status();
-    Serial.printf("--- Gateway: Wi-Fi %s, free heap %u B, cloud batches skipped %lu ---\n",
-                  wifiConnected ? "connected" : "DISCONNECTED", (unsigned)ESP.getFreeHeap(), (unsigned long)fb_dropped);
-    Serial.println("--- Sink Stats (unique packets per origin) ---");
+    Serial.printf_P(PSTR("--- GW: WiFi=%s heap=%uB dropped=%lu ---\n"),
+                    wifiConnected ? "OK" : "DOWN", (unsigned)ESP.getFreeHeap(), (unsigned long)fb_dropped);
+    Serial.println(F("--- Sink Stats ---"));
     for (int i = 1; i <= 3; i++) {
       origin_stats_t& os = origin_stats[i];
       if (!os.ever_seen) continue;
@@ -955,9 +945,8 @@ void loop() {
       uint32_t rx = (os.unique_rx > expected) ? expected : os.unique_rx;
       float pdr = expected ? rx * 100.0f / expected : 0;
       float avg_delay = os.delay_samples ? (float)os.total_delay_ms / os.delay_samples : 0;
-      Serial.printf("  N%d: rx=%lu exp=%lu PDR=%.1f%% lost=%lu dups=%lu ooo=%lu avg_delay=%.0f ms last_path=%s\n",
-        i, (unsigned long)rx, (unsigned long)expected, pdr, (unsigned long)(expected - rx),
-        (unsigned long)mesh.dup_rx_by_origin[i], (unsigned long)os.out_of_order, avg_delay, os.last_path);
+      Serial.printf_P(PSTR("  N%d rx=%lu/%lu PDR=%.1f%% dly=%.0fms path=%s\n"),
+        i, (unsigned long)rx, (unsigned long)expected, pdr, avg_delay, os.last_path);
     }
   }
 }

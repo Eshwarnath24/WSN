@@ -161,6 +161,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 1 (Vibration Sensor) BOOTING =====");
+  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   // 1. Sensor
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -220,21 +221,17 @@ void loop() {
 
   // 6. TDMA: one new packet per assigned TX slot occurrence
   static uint32_t lastOpportunity = 0xFFFFFFFF;
-  if (mesh_data_window_open()) {
-    uint32_t key = mesh_tx_opportunity_key();
-    if (key != lastOpportunity) {
-      lastOpportunity = key;
-      if (mesh_own_tx_busy(OWN_TX_DATA)) {
-        // previous packet still pending → it is retransmitted below
-      } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
-        mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(accelX, accelY, accelZ, "vibration"));
-        hasNewSensorData = false;
-        Serial.printf("[TDMA] %s: TX opportunity — sending vibration reading seq=%d via N%d\n",
-                      epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
-                      mesh.next_hop_to_sink);
-      } else if (mesh.tdma.synced) {
-        mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
-      }
+  if (mesh_take_data_opportunity(lastOpportunity)) {
+    if (mesh_own_tx_busy(OWN_TX_DATA)) {
+      // previous packet still pending → it is retransmitted below
+    } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
+      mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(accelX, accelY, accelZ, "vibration"));
+      hasNewSensorData = false;
+      LOGE("[TDMA] %s: TX opportunity — sending vibration reading seq=%d via N%d\n",
+           epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+           mesh.next_hop_to_sink);
+    } else if (mesh.tdma.synced) {
+      mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
     }
   }
   // (Re)transmit pending own data in own slot or CAP

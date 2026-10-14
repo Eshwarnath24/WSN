@@ -243,6 +243,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 3 (Cluster Head / Aggregator / IR) BOOTING =====");
+  Serial.printf("Firmware: %s\n", WSN_FW_VERSION);
 
   pinMode(IR_DO_PIN, INPUT);
   lastRawReading = digitalRead(IR_DO_PIN);
@@ -297,25 +298,21 @@ void loop() {
 
   // 4. Aggregation: one AGG per window in my TX slot (S3)
   static uint32_t lastOpportunity = 0xFFFFFFFF;
-  if (mesh_data_window_open()) {
-    uint32_t key = mesh_tx_opportunity_key();
-    if (key != lastOpportunity) {
-      lastOpportunity = key;
-      uint32_t frame = tdma_current_frame();
-      bool window_done = !mesh.tdma.synced || aggUrgent || (frame - lastAggFrame) >= AGG_WINDOW_FRAMES;
+  if (mesh_take_data_opportunity(lastOpportunity)) {
+    uint32_t frame = tdma_current_frame();
+    bool window_done = !mesh.tdma.synced || aggUrgent || (frame - lastAggFrame) >= AGG_WINDOW_FRAMES;
+    if (mesh_own_tx_busy(OWN_TX_DATA)) {
+      // previous AGG still pending → retransmitted below
+    } else if (window_done) {
+      lastAggFrame = frame;
+      agg_send_window();
       if (mesh_own_tx_busy(OWN_TX_DATA)) {
-        // previous AGG still pending → retransmitted below
-      } else if (window_done) {
-        lastAggFrame = frame;
-        agg_send_window();
-        if (mesh_own_tx_busy(OWN_TX_DATA)) {
-          Serial.printf("[TDMA] %s: TX opportunity — sending AGG seq=%d via N%d\n",
-                        epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
-                        mesh.next_hop_to_sink);
-        }
-      } else {
-        mesh_note_unused_slot("aggregation window still collecting");
+        LOGE("[TDMA] %s: TX opportunity — sending AGG seq=%d via N%d\n",
+             epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+             mesh.next_hop_to_sink);
       }
+    } else {
+      mesh_note_unused_slot("aggregation window still collecting");
     }
   }
   if (mesh_own_tx_busy(OWN_TX_DATA) && mesh_retry_window_open()) {

@@ -307,10 +307,10 @@ void ble_tick() {
   for (int i = 1; i <= NUM_NODES; i++) {
     if (i == MY_NODE_ID) continue;
     ble_neighbor_t& bn = mesh.ble[i];
-    if (bn.discovered && now - bn.last_seen_ms > BLE_NEIGHBOR_EXPIRY_MS) {
+    if (bn.discovered && wsn_age_ms(bn.last_seen_ms) > BLE_NEIGHBOR_EXPIRY_MS) {
       bn.discovered = false;
       bn.rssi_filtered = 0;
-      Serial.printf("[BLE] N%d expired (not seen for %lu ms)\n", i, (unsigned long)(now - bn.last_seen_ms));
+      LOGV("[BLE] N%d expired (not seen for %lu ms)\n", i, (unsigned long)wsn_age_ms(bn.last_seen_ms));
     }
   }
   // Scan only inside the SLEEP epoch, where no Wi-Fi traffic is scheduled
@@ -365,7 +365,7 @@ void ble_print_status() {
     if (bn.discovered) {
       Serial.printf("  N%d: RSSI=%d dBm filtered=%.1f dBm dist=%.2f m (last %lu ms ago)\n",
                     i, bn.rssi_raw, bn.rssi_filtered, bn.distance_m,
-                    (unsigned long)(millis() - bn.last_seen_ms));
+                    (unsigned long)wsn_age_ms(bn.last_seen_ms));
     } else {
       Serial.printf("  N%d: not discovered\n", i);
     }
