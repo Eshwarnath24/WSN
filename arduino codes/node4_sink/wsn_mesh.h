@@ -50,7 +50,6 @@ bool mac_send_broadcast(wsn_packet_t& pkt, bool log);
 void mac_send_ack(const wsn_packet_t& received_pkt);
 bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt);
 void tdma_apply_schedule(const schedule_payload_t& sp, bool local);
-void mesh_print_status();
 
 // Application-level callbacks (implemented in each node's .ino)
 extern void app_on_data_for_me(const wsn_packet_t& pkt, int rssi);
@@ -185,7 +184,7 @@ bool mesh_seen_before(uint8_t type, uint8_t origin, uint16_t seq) {
   for (int i = 0; i < DUP_CACHE_SIZE; i++) {
     dup_entry_t& e = mesh.dup_cache[i];
     if (e.t_ms != 0 && e.type == type && e.origin == origin && e.seq == seq &&
-        wsn_age_ms(e.t_ms) < DUP_CACHE_TTL_MS) {
+        (int32_t)(now - e.t_ms) < (int32_t)DUP_CACHE_TTL_MS) {
       dup = true;
       break;
     }
@@ -225,16 +224,14 @@ bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt) {
     esp_now_add_peer(&peer);
   }
 
-  // Retry once: on N4 the WiFi driver is also serving an HTTP connection;
-  // esp_now_send sometimes returns ESP_ERR_ESPNOW_NO_MEM or similar for 1-2 ms.
   esp_err_t result = esp_now_send(mac, (const uint8_t*)&pkt, wsn_wire_len(pkt));
-  if (result != ESP_OK) {
-    yield();  // let WiFi driver finish current transaction
+  if (result == ESP_ERR_ESPNOW_NO_MEM) {   // driver TX queue momentarily full → one retry
+    yield();
     delay(2);
     result = esp_now_send(mac, (const uint8_t*)&pkt, wsn_wire_len(pkt));
   }
   if (result != ESP_OK) {
-    LOGE("[ESP-NOW] Send FAILED to %s (err=%d)\n", nodeIdStr(dst_id), result);
+    Serial.printf("[ESP-NOW] Raw send FAILED to %s (err=%d)\n", nodeIdStr(dst_id), result);
     return false;
   }
   return true;
@@ -263,7 +260,7 @@ bool mac_cca(uint32_t since_ms = 0) {
   if (mac_channel_busy(since_ms)) {
     mesh.mac_stats.cca_busy_count++;
     LOGV("[MAC] CCA: BUSY (WSN frame sniffed %lu ms ago)\n",
-         (unsigned long)wsn_age_ms(mesh.last_rx_time_ms));
+                  (unsigned long)wsn_age_ms(mesh.last_rx_time_ms));
     return false;
   }
   return true;
@@ -317,15 +314,15 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
     if (left < need) {
       mesh.mac_stats.total_deferrals++;
       LOGV("[MAC] DEFER seq=%d: %ld ms left in %s < %ld ms needed → continue in next slot/CAP\n",
-           pkt.seq_num, (long)(left > 0 ? left : 0), epochStr(tdma_current_epoch()), (long)need);
+                    pkt.seq_num, (long)(left > 0 ? left : 0), epochStr(tdma_current_epoch()), (long)need);
       return MAC_DEFERRED;
     }
 
     // 1. Channel sensing
     bool idle = mac_cca();
     LOGV("[MAC] CSMA %s seq=%d → N%d attempt %d/%d: channel %s\n",
-         msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.dst_id,
-         attempts + 1, MAC_MAX_ATTEMPTS, idle ? "IDLE" : "BUSY");
+                  msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.dst_id,
+                  attempts + 1, MAC_MAX_ATTEMPTS, idle ? "IDLE" : "BUSY");
 
     // 2. Random backoff (always, so simultaneous senders de-synchronise)
     uint32_t bo_start = millis();
@@ -335,7 +332,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
     if (!mac_cca(bo_start)) {
       busy_rounds++;
       LOGV("[MAC] Contention: channel taken during backoff → defer seq=%d (CW doubles)\n",
-           pkt.seq_num);
+                    pkt.seq_num);
       continue;
     }
 
@@ -353,7 +350,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
     if (attempts > 1) {
       mesh.mac_stats.total_retries++;
       LOGE("[MAC] RETRANSMIT seq=%d to N%d (attempt %d/%d)\n",
-           pkt.seq_num, pkt.dst_id, attempts, MAC_MAX_ATTEMPTS);
+                    pkt.seq_num, pkt.dst_id, attempts, MAC_MAX_ATTEMPTS);
     }
     logPacket("TX", pkt);
     bool sent = espnow_raw_send(pkt.dst_id, pkt);
@@ -378,7 +375,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
       n.consec_ack_fails = 0;
       n.ack_success_rate = 0.2f * 1.0f + 0.8f * n.ack_success_rate;
       LOGV("[MAC] ACK OK seq=%d from N%d (RTT=%lu ms, attempt %d)\n",
-           pkt.seq_num, nb, (unsigned long)rtt, attempts);
+                    pkt.seq_num, nb, (unsigned long)rtt, attempts);
       return MAC_OK;
     }
 
@@ -387,7 +384,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
     n.consec_ack_fails++;
     n.ack_success_rate = 0.8f * n.ack_success_rate;
     LOGE("[MAC] ACK TIMEOUT seq=%d from N%d after %d ms (attempt %d/%d, consecutive=%d)\n",
-         pkt.seq_num, nb, ACK_TIMEOUT_MS, attempts, MAC_MAX_ATTEMPTS, n.consec_ack_fails);
+                  pkt.seq_num, nb, ACK_TIMEOUT_MS, attempts, MAC_MAX_ATTEMPTS, n.consec_ack_fails);
 
     // Failure detection: repeated ACK timeouts → link dead → reroute this packet
     if (n.consec_ack_fails >= LINK_FAIL_ACK_TIMEOUTS && n.link_alive) {
@@ -398,7 +395,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
         mesh.mac_stats.total_reroutes++;
         if (attempts > MAC_MAX_ATTEMPTS - 2) attempts = MAC_MAX_ATTEMPTS - 2;
         LOGE("[ROUTE] Re-routing seq=%d (origin N%d) via ALTERNATE next hop N%d\n",
-             pkt.seq_num, pkt.origin_id, alt);
+                      pkt.seq_num, pkt.origin_id, alt);
       }
     }
   }
@@ -406,7 +403,7 @@ mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms
   // All attempts used
   mesh.mac_stats.total_drops++;
   LOGE("[MAC] DROPPED seq=%d to N%d after %d attempts\n",
-       pkt.seq_num, pkt.dst_id, MAC_MAX_ATTEMPTS);
+                pkt.seq_num, pkt.dst_id, MAC_MAX_ATTEMPTS);
   return MAC_DROPPED;
 }
 
@@ -492,6 +489,19 @@ float routing_cost(uint8_t neighbor_id) {
   return cost;
 }
 
+// --- Best next hop toward the sink, ignoring one neighbour (0 = none) ---
+uint8_t routing_best_hop_excluding(uint8_t excluded) {
+  if (MY_NODE_ID == SINK_ID) return SINK_ID;
+  float best = ROUTE_INFINITY;
+  uint8_t hop = 0;
+  for (int i = 1; i <= NUM_NODES; i++) {
+    if (i == MY_NODE_ID || i == excluded) continue;
+    float c = routing_cost(i);
+    if (c < best) { best = c; hop = i; }
+  }
+  return hop;
+}
+
 // --- Recompute best next hop toward the sink ---
 void routing_recompute_next_hop() {
   if (MY_NODE_ID == SINK_ID) {
@@ -516,7 +526,7 @@ void routing_recompute_next_hop() {
   if (best_hop != old) {
     if (best_hop != 0) {
       LOGE("[ROUTE] Next hop changed: %s → N%d (cost=%.2f, hops_to_sink=%d)\n",
-           old ? nodeIdStr(old) : "none", best_hop, best_cost, routing_my_hops());
+                    old ? nodeIdStr(old) : "none", best_hop, best_cost, routing_my_hops());
     } else {
       LOGE("[ROUTE] WARNING: No route to sink!\n");
     }
@@ -538,7 +548,7 @@ void routing_mark_link_dead(uint8_t nb, const char* reason) {
   mesh.neighbors[nb].link_alive = false;
   if (was_alive) {
     LOGE("[ROUTE] *** Link N%d→N%d DEAD (%s) — failure detected ***\n",
-         MY_NODE_ID, nb, reason);
+                  MY_NODE_ID, nb, reason);
     routing_queue_route_update(MY_NODE_ID, nb, false);
   }
   routing_recompute_next_hop();
@@ -554,7 +564,7 @@ void routing_note_neighbor_alive(uint8_t nid, int rssi) {
   nb.wifi_rssi = (int8_t)rssi;
   if (was_dead) {
     LOGE("[ROUTE] Link N%d↔N%d UP (heard %s, RSSI=%d)\n",
-         MY_NODE_ID, nid, nid == SINK_ID ? "sink" : "HELLO", rssi);
+                  MY_NODE_ID, nid, nid == SINK_ID ? "sink" : "HELLO", rssi);
     routing_queue_route_update(MY_NODE_ID, nid, true);
   }
 }
@@ -618,7 +628,7 @@ void mesh_handle_hello(const wsn_packet_t& pkt, int rssi) {
     mesh.tdma.last_sync_ms = millis();
     if (!was_synced) {
       LOGE("[TDMA] Synchronised via N%d HELLO (multi-hop time sync), offset=%ld ms\n",
-           nid, (long)mesh.tdma.clock_offset);
+                    nid, (long)mesh.tdma.clock_offset);
     }
   }
 
@@ -658,7 +668,7 @@ bool mesh_enqueue_forward(const wsn_packet_t& in) {
   portEXIT_CRITICAL(&mesh_mux);
   if (ok) {
     LOGV("[ROUTE] Queued %s seq=%d (origin N%d) for forwarding (queue=%d)\n",
-         msgTypeStr(p.msg_type), p.seq_num, p.origin_id, depth);
+                  msgTypeStr(p.msg_type), p.seq_num, p.origin_id, depth);
   } else {
     LOGE("[ROUTE] Fwd queue full — dropping packet\n");
   }
@@ -686,14 +696,21 @@ void mesh_service_forward_queue() {
     uint8_t next = mesh.next_hop_to_sink;
     mac_result_t r;
     if (next == 0) {
-      Serial.printf("[ROUTE] Cannot forward seq=%d (origin N%d) — no route to sink\n", e.pkt.seq_num, e.pkt.origin_id);
+      LOGE("[ROUTE] Cannot forward seq=%d (origin N%d) — no route to sink\n", e.pkt.seq_num, e.pkt.origin_id);
       r = MAC_NO_ROUTE;
-    } else if (next == e.pkt.src_id) {
-      Serial.printf("[ROUTE] Not returning seq=%d to previous hop N%d (loop avoided) — dropped\n", e.pkt.seq_num, next);
+    } else if (next == e.pkt.src_id && routing_best_hop_excluding(e.pkt.src_id) == 0) {
+      LOGE("[ROUTE] Not returning seq=%d to previous hop N%d and no other route (loop avoided) — dropped\n", e.pkt.seq_num, next);
       r = MAC_NO_ROUTE;
     } else {
+      if (next == e.pkt.src_id) {
+        // Our route just flipped back toward the node that handed us this packet
+        // (e.g. after 'restore'): use the best OTHER neighbour instead of dropping.
+        next = routing_best_hop_excluding(e.pkt.src_id);
+        LOGE("[ROUTE] seq=%d came from N%d — sending it via N%d instead (no ping-pong)\n",
+             e.pkt.seq_num, e.pkt.src_id, next);
+      }
       e.pkt.dst_id = next;
-      Serial.printf("[ROUTE] Forwarding %s seq=%d (origin=N%d) via N%d\n",
+      LOGV("[ROUTE] Forwarding %s seq=%d (origin=N%d) via N%d\n",
                     msgTypeStr(e.pkt.msg_type), e.pkt.seq_num, e.pkt.origin_id, next);
       r = mac_send(e.pkt, e.attempts, tdma_epoch_deadline());
     }
@@ -731,7 +748,7 @@ void mesh_handle_route_update(const wsn_packet_t& pkt) {
   route_update_payload_t ru;
   getPayload(pkt, ru);
   LOGE("[ROUTE] Route update from N%d: Link N%d↔N%d %s\n",
-       pkt.src_id, ru.node_a, ru.node_b, ru.link_up ? "UP" : "DOWN");
+                pkt.src_id, ru.node_a, ru.node_b, ru.link_up ? "UP" : "DOWN");
   routing_recompute_next_hop();
 }
 
@@ -775,10 +792,10 @@ void mesh_handle_beacon(const wsn_packet_t& pkt, int rssi) {
     wifi_second_chan_t sec;
     esp_wifi_get_channel(&ch, &sec);
     LOGE("[TDMA] Beacon sync: frame=%lu offset=%ld ms | Channel %d LOCKED\n",
-         (unsigned long)bp.frame_number, (long)mesh.tdma.clock_offset, ch);
+                  (unsigned long)bp.frame_number, (long)mesh.tdma.clock_offset, ch);
   } else if (bp.frame_number % 25 == 0) {
     LOGV("[TDMA] Beacon frame=%lu (clock correction %+ld ms)\n",
-         (unsigned long)bp.frame_number, (long)correction);
+                  (unsigned long)bp.frame_number, (long)correction);
   }
 }
 
@@ -869,7 +886,7 @@ void tdma_apply_schedule(const schedule_payload_t& sp, bool local) {
   char table[96];
   tdma_schedule_to_string(sp, table, sizeof(table));
   LOGE("[TDMA] Schedule v%u from N%d applied (%s): %s\n",
-       sp.version, sp.issuer, sp.update_reason, table);
+                sp.version, sp.issuer, sp.update_reason, table);
   char mine[48] = "";
   for (uint8_t e = EPOCH_SLOT1; e <= EPOCH_SLOT4; e++) {
     char part[16];
@@ -886,7 +903,18 @@ void tdma_apply_schedule(const schedule_payload_t& sp, bool local) {
 void mesh_handle_schedule(const wsn_packet_t& pkt) {
   schedule_payload_t sp;
   getPayload(pkt, sp);
-  if (sp.issuer != pkt.origin_id) return;
+  // N4 relays N3's schedule (origin N4, issuer N3) for nodes that cannot hear N3.
+  bool relayed = (pkt.origin_id == SINK_ID && sp.issuer == CLUSTER_HEAD_ID);
+  if (sp.issuer != pkt.origin_id && !relayed) return;
+  if (MY_NODE_ID == SINK_ID && sp.issuer == CLUSTER_HEAD_ID && !relayed) {
+    mesh.last_primary_sched = sp;
+    mesh.last_primary_rx_ms = millis();
+  }
+  if (relayed) {
+    if (MY_NODE_ID == CLUSTER_HEAD_ID) return;              // my own schedule echoed back
+    if (mesh.tdma.schedule_received && mesh.tdma.sched_issuer == CLUSTER_HEAD_ID &&
+        (int16_t)(sp.version - mesh.tdma.sched_version) < 0) return;   // older copy
+  }
   tdma_apply_schedule(sp, false);
 }
 
@@ -945,7 +973,7 @@ bool tdma_epoch_is_active(tdma_epoch_t e) {
 void mesh_note_unused_slot(const char* why) {
   mesh.tdma.unused_slots++;
   if (mesh.tdma.unused_slots % 10 == 1) {
-    Serial.printf("[TDMA] %s unused (%s) → radio idle [unused own slots=%lu]\n",
+    LOGV("[TDMA] %s unused (%s) → radio idle [unused own slots=%lu]\n",
                   epochStr(tdma_current_epoch()), why, (unsigned long)mesh.tdma.unused_slots);
   }
 }
@@ -978,13 +1006,13 @@ void tdma_tick() {
     }
     uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
     float duty = total ? (mesh.tdma.active_time_ms * 100.0f / total) : 100.0f;
-    Serial.printf("[TDMA] Frame %lu | sched v%u | radio idle/sleep in: %s| duty=%.1f%% (active=%lu ms, sleep=%lu ms)\n",
+    LOGV("[TDMA] Frame %lu | sched v%u | radio idle/sleep in: %s| duty=%.1f%% (active=%lu ms, sleep=%lu ms)\n",
                   (unsigned long)frame, mesh.tdma.sched_version, idle, duty,
                   (unsigned long)mesh.tdma.active_time_ms, (unsigned long)mesh.tdma.sleep_time_ms);
   }
 
   if (epoch == EPOCH_SLEEP && frame % TDMA_LOG_EVERY_FRAMES == 0) {
-    Serial.printf("[TDMA] SLEEP epoch: no Wi-Fi TX for %d ms (wake at next BEACON)\n", SLEEP_DURATION_MS);
+    LOGV("[TDMA] SLEEP epoch: no Wi-Fi TX for %d ms (wake at next BEACON)\n", SLEEP_DURATION_MS);
   }
 
 #if WSN_ENABLE_LIGHT_SLEEP
@@ -1054,7 +1082,7 @@ void mesh_on_recv(const uint8_t* mac_addr, const uint8_t* data, int len) {
       (pkt.dst_id != BROADCAST_ID && (pkt.dst_id < 1 || pkt.dst_id > NUM_NODES))) {
     mesh.mac_stats.malformed_rx++;
     if (mesh.mac_stats.malformed_rx % 10 == 1) {
-      Serial.printf("[MESH] Malformed frame type=0x%02X from N%d (len=%d payload_len=%d) — dropped\n",
+      LOGE("[MESH] Malformed frame type=0x%02X from N%d (len=%d payload_len=%d) — dropped\n",
                     pkt.msg_type, pkt.src_id, len, pkt.payload_len);
     }
     return;
@@ -1109,9 +1137,11 @@ void mesh_on_sent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
 void mesh_on_sent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
   // Link-layer (802.11) delivery status; end-to-end hop reliability uses the app ACK.
-  // On N4 these are common when WiFi is also running HTTP — suppressed at log level <2.
+  // Failures are normal under interference (the app-level ACK/retransmit
+  // recovers them), so they are only counted (MAC line) and traced at log 2.
   if (status != ESP_NOW_SEND_SUCCESS) {
-    LOGV("[ESP-NOW] Link-layer send failed (WiFi busy, mesh ACK handles recovery)\n");
+    mesh.mac_stats.ll_fail++;
+    LOGV("[ESP-NOW] Link-layer send failed (total %lu)\n", (unsigned long)mesh.mac_stats.ll_fail);
   }
 }
 
@@ -1140,7 +1170,7 @@ bool mesh_accept_unicast(const wsn_packet_t& pkt) {
     mesh.mac_stats.dup_rx++;
     mesh.dup_rx_by_origin[pkt.origin_id]++;
     LOGV("[MAC] Duplicate %s seq=%d origin=N%d from N%d (re-ACKed, not re-processed)\n",
-         msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.origin_id, pkt.src_id);
+                  msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.origin_id, pkt.src_id);
     return false;
   }
   logPacket("RX", pkt);
@@ -1186,15 +1216,15 @@ void mesh_handle_ctrl(const wsn_packet_t& pkt) {
   switch (cp.cmd) {
     case CTRL_COLLISION_TEST:
       mesh.collision_test_trigger = true;
-      wsn_log_force_until = millis() + 4000;
-      Serial.println("[CTRL] Collision test armed (N1/N2 will contend at the start of the next CAP)");
+      wsn_log_force_until = millis() + 3000;   // show the full CSMA trace of the contention
+      LOGE("[CTRL] Collision test armed (N1/N2 will contend at the start of the next CAP)\n");
       break;
 
     case CTRL_KILL_LINK:
       if (cp.param1 == MY_NODE_ID || cp.param2 == MY_NODE_ID) {
         uint8_t other = (cp.param1 == MY_NODE_ID) ? cp.param2 : cp.param1;
         if (other >= 1 && other <= NUM_NODES) {
-          Serial.printf("[CTRL] Software link kill (failure injection): N%d↔N%d\n", cp.param1, cp.param2);
+          LOGE("[CTRL] Software link kill (failure injection): N%d↔N%d\n", cp.param1, cp.param2);
           routing_mark_link_dead(other, "software link kill");
           mesh.killed_links[other] = true;
           routing_recompute_next_hop();
@@ -1204,7 +1234,7 @@ void mesh_handle_ctrl(const wsn_packet_t& pkt) {
 
     case CTRL_RESTORE_LINKS:
       for (int i = 1; i <= NUM_NODES; i++) mesh.killed_links[i] = false;
-      Serial.println("[CTRL] All software link kills restored (links come back on next HELLO/BEACON)");
+      LOGE("[CTRL] All software link kills restored (links come back on next HELLO/BEACON)\n");
       mesh.hello_triggered = true;
       routing_recompute_next_hop();
       break;
@@ -1266,36 +1296,14 @@ void mesh_init() {
   uint8_t ch = 0;
   wifi_second_chan_t sec;
   esp_wifi_get_channel(&ch, &sec);
-  Serial.printf("[MESH] Initialized: N%d (%s) | ESP-NOW on Wi-Fi channel %d | %s\n",
-                MY_NODE_ID, roleStr(mesh.my_role), ch, WSN_FW_VERSION);
+  Serial.printf("[FW] %s | log level %d (type 'log 2' for the full packet trace)\n", WSN_FW_VERSION, wsn_log_level);
+  Serial.printf("[MESH] Initialized: N%d (%s) | ESP-NOW on Wi-Fi channel %d\n",
+                MY_NODE_ID, roleStr(mesh.my_role), ch);
   Serial.printf("[MESH] My MAC: %s\n", WiFi.macAddress().c_str());
-}
-
-// Check serial for 'log <0|1|2>' and 'status' on non-sink nodes
-inline void mesh_check_serial_cmd() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.startsWith("log ") && line.length() >= 5) {
-    int lvl = line.charAt(4) - '0';
-    if (lvl >= 0 && lvl <= 2) {
-      wsn_log_level = (uint8_t)lvl;
-      Serial.printf("[LOG] Serial log level set to %d (%s)\n",
-                    wsn_log_level,
-                    wsn_log_level == 0 ? "summaries only" :
-                    wsn_log_level == 1 ? "events + 5 s summaries (default)" : "full per-packet trace");
-    }
-  } else if (line == "status") {
-    mesh_print_status();
-  }
 }
 
 void mesh_loop() {
   uint32_t now = millis();
-
-  if (MY_NODE_ID != SINK_ID) {
-    mesh_check_serial_cmd();
-  }
 
   tdma_tick();
   tdma_epoch_t epoch = tdma_current_epoch();
@@ -1306,7 +1314,7 @@ void mesh_loop() {
       mesh.tdma.synced = false;
       mesh.tdma.synced_from_beacon = false;
       LOGE("[TDMA] *** Sync lost (no beacon / synced HELLO for %lu ms) — rescanning channels ***\n",
-           (unsigned long)wsn_age_ms(mesh.tdma.last_sync_ms));
+                    (unsigned long)wsn_age_ms(mesh.tdma.last_sync_ms));
     }
     if (!mesh.tdma.synced) {
       static uint32_t lastChannelHop = 0;
@@ -1346,6 +1354,17 @@ void mesh_loop() {
       mesh.sched_announce_pending = false;
       tdma_announce_schedule(changed);
     }
+    // N4: relay the current N3 schedule (nodes out of N3's radio range get it too)
+    if (MY_NODE_ID == SINK_ID && !mesh.sched_is_coordinator && mesh.last_primary_rx_ms != 0 &&
+        wsn_age_ms(mesh.last_primary_rx_ms) < 2 * SCHED_REBROADCAST_MS &&
+        now - mesh.last_sched_relay_ms >= SCHED_REBROADCAST_MS) {
+      mesh.last_sched_relay_ms = now;
+      wsn_packet_t rp;
+      initPacket(rp, MSG_SCHEDULE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, 0);
+      setPayload(rp, mesh.last_primary_sched);
+      mac_send_broadcast(rp, false);
+      LOGV("[TDMA] Relayed N3 schedule v%u\n", mesh.last_primary_sched.version);
+    }
     if ((mesh.hello_triggered && now - mesh.last_hello_ms >= HELLO_MIN_GAP_MS) ||
         now - mesh.last_hello_ms >= HELLO_INTERVAL_MS) {
       routing_send_hello();
@@ -1376,6 +1395,7 @@ void mesh_own_tx_load(uint8_t idx, const wsn_packet_t& pkt) {
 mac_result_t mesh_own_tx_service(uint8_t idx) {
   own_tx_t& o = mesh.own_tx[idx];
   if (!o.active) return MAC_OK;
+  if (!mesh_retry_window_open()) return MAC_DEFERRED;   // never transmit outside own slot / CAP
   uint32_t key = mesh_tx_opportunity_key();
   if (o.defer_key == key) return MAC_DEFERRED;   // wait for the next slot/CAP
   uint8_t next = mesh.next_hop_to_sink;

@@ -794,3 +794,44 @@ node dashtest/test.mjs <dashboardDir> <rundir>/firebase.jsonl [untilMs] [label]
 - SIM with an MPU6500 clone (WHO_AM_I = 0x70), BLE noise σ = 6 dB and 2% loss: N1 data delivered (PDR 100%), all Firebase batches valid JSON (41 requests in about 80 s), dashboard shows 3/3 active and 4/4 localized.
 - My JSON validation also found and fixed a bug in the new batching code (it stripped too many closing braces).
 - **Hardware re-test pending.** The simulator cannot reproduce Wi-Fi/BLE radio starvation or real RSSI.
+
+---
+
+## 31. Hardware Test Round 2: Findings and Fixes
+
+**What the logs showed:** your boards were still running the **old firmware**. Your logs contain `[Firebase] Queue FULL`, `[BLE] Scan complete: N WSN neighbour(s) known` and a distance of 0.03 m; none of these can be printed by the round-1 code. To prevent this confusion, every node now prints `[FW] WSN-FW 2.2 …` at boot. All four boards must show the same line.
+
+**New bugs found and fixed in this round:**
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| R2-1 | Nodes flip between "discovered" and "expired"; nodes briefly flagged INACTIVE; sudden "Sync lost", link-DEAD and channel rescans | **Timestamp race:** the loop samples `now`, a Wi-Fi/BLE callback then stamps a *later* time, and `now − t` wraps to about 4.29 × 10⁹ ms. Reproduced in SIM: `Sync lost (… 4294967294 ms)`. | `wsn_age_ms()` helper (signed difference, never negative) used for every timestamp written by a callback: sync, beacon, HELLO, BLE last-seen, N4 node liveness, N3 alert, schedule timeouts |
+| R2-2 | N2 transmitting in **S3** (N3's slot) | The slot was checked and the opportunity created at different moments; a slow loop iteration at the slot boundary crossed into the next slot | `mesh_take_data_opportunity()` decides from a single clock reading and refuses to start in the last ~70 ms of a slot. `mesh_own_tx_service()` re-checks the window before transmitting. |
+| R2-3 | Unreadable Serial Monitor | Every packet printed (tens of lines per second) | Log levels (`log 0/1/2`, saved in flash). Default: events plus one compact status block per node every 5 s. The collision test shows the full trace for 3 s automatically. |
+| R2-4 | One aggregate lost when links were restored | A queued packet whose route flipped back to its previous hop was dropped | Forwarded via the best *other* neighbour instead |
+| R2-5 | Unclear sensor requirement | Guidelines: N1 and N2 are sensor nodes; N3/N4 need no sensor | N3's IR sensor is optional (`N3_HAS_IR_SENSOR`). Wiring and placement are in `docs/HARDWARE_SETUP.md`. |
+
+**Testing:**
+- Host build: 0 warnings on both ESP-IDF API variants.
+- Two clean 75 s SIM runs: 0 false sync losses, expiries, link deaths or drops; PDR 100%.
+- Full 150 s failure scenario: v1 → v2 → v3 → N4 failover, PDR 99.5%. The 2 lost readings were in N3's buffer when it was powered off.
+- **Hardware re-test pending.**
+
+## 32. Hardware Test Round 3: Findings and Fixes (FW 2.3)
+
+The round 3 logs came from the commit on `main` (`e0b1b52`), not from FW 2.2.
+
+| # | Symptom in the logs | Root cause | Fix (FW 2.3) |
+|---|---|---|---|
+| 1 | N4: `[WiFi] FAILED(6) mesh running`, `E wifi:sta is connecting, cannot set config`, repeating every 10 s | The reconnect called `WiFi.disconnect(true)` (radio off) and then `WiFi.begin()` with a blocking full 13-channel scan, while the previous attempt was still running. | Wi-Fi auto-reconnect is off. N4 reconnects from `cloudTask` without blocking, every 15 s, pinned to the saved channel and BSSID. It calls `disconnect(false)` first, so the radio stays on and no attempt overlaps the previous one. A full scan runs only if the hotspot was never found, or after 4 failed pinned attempts (at most once a minute). |
+| 2 | N1–N3: `Link-layer send failed`, ACK timeouts, `Link N3→N4 DEAD`, routes flapping N2↔N4 | During each full scan N4 was off the mesh channel, so every unicast to N4 failed. | Fixed by #1: N4 now stays on the mesh channel. Link-layer failures are counted (`radio-level fails` in the MAC line) and printed only at `log 2`. ESP-NOW `NO_MEM` gets one retry. |
+| 3 | N4: `[Firebase] busy—batch skipped` flood while Wi-Fi was down | Batches were still queued with no connection. | While Wi-Fi is down, batches are counted as "not sent while down" instead of queued, the queue is drained when the link is lost, and the busy log is rate-limited. |
+| 4 | N3: `N1: not discovered`, N2 at −94 dBm | BLE signal at the sensitivity limit (distance/obstruction). Continuous adverts also compete with Wi-Fi for the radio. | Synced nodes advertise in a 25 ms burst only inside the SLEEP epoch, when every node scans: about 2× more adverts per scan and no BLE traffic during the data slots. The status line now says when a neighbour is reachable over Wi-Fi but not over BLE. The placement guide is in HARDWARE_SETUP §7. |
+| 5 | Only 2 BLE anchors, so no position | — | 2-anchor weighted-proximity estimate, with the closer anchor weighing more. |
+| 6 | N2 never hears N3, so it has no schedule | N3 is out of N2's range. | N4 relays the current N3 schedule every 4 s in the CAP. Nodes accept the relay only if it isn't older than the version they already have. |
+| 7 | Dashboard empty with the `main` firmware | `e0b1b52` renamed the Firebase keys and produced invalid JSON (`"sched":N%d`). | FW 2.3 keeps the keys `dashboard.js` reads. The jsdom replay test passes (all cards, 4/4 nodes localized). |
+
+Host simulation results (FW 2.3):
+- **25 s hotspot outage:** PDR 100%, no link marked DEAD, reconnected on the pinned channel.
+- **N2↔N3 link blocked:** N2 receives schedule v1/v2 through N4's relay.
+- **Full failure scenario:** PDR 100% (447/447) on both IDF 5.1 and 5.5 callback variants.

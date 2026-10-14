@@ -26,7 +26,7 @@
 #endif
 
 // Printed at boot on every node: check that all 4 boards show the SAME version.
-#define WSN_FW_VERSION "WSN-FW 2.2 (readable logs, slot-safe TX)"
+#define WSN_FW_VERSION "WSN-FW 2.3 (Wi-Fi stays on mesh channel, BLE in SLEEP epoch)"
 
 // ==================== NETWORK CONSTANTS ====================
 #define NUM_NODES             4
@@ -88,7 +88,8 @@
 #define BLE_SCAN_DURATION_MS  110     // Scan burst (100% window); must fit inside the 130 ms SLEEP epoch
 #define BLE_SCAN_PERIOD_MS    700     // => a burst in (almost) every superframe
 #define BLE_BOOT_DISCOVERY_MS 1500    // Initial BLE discovery before Wi-Fi start
-#define BLE_ADV_INTERVAL_MS   50      // 50–70 ms adverts => several per 110 ms scan burst
+#define BLE_ADV_INTERVAL_MS   50      // continuous advertising while not TDMA-synced (boot discovery)
+#define BLE_ADV_BURST_INTERVAL_MS 25  // synced: advertise only in the SLEEP epoch, 25–30 ms => ~4 adverts per scan
 #define BLE_TX_POWER_1M       (-59)   // Calibrated RSSI at 1 m (calibrate per environment)
 #define BLE_PATH_LOSS_N       2.2f    // Path loss exponent (indoor)
 #define BLE_EWMA_ALPHA        0.3f
@@ -347,6 +348,7 @@ struct mac_stats_t {
   uint32_t total_reroutes;      // Packets re-addressed to an alternate next hop
   uint32_t dup_rx;              // Duplicate frames received (re-ACKed, not re-processed)
   uint32_t malformed_rx;        // Frames rejected by validation
+  volatile uint32_t ll_fail;    // 802.11 link-layer send failures (no MAC-level ACK from the peer radio)
 };
 
 // ==================== TDMA STATE ====================
@@ -519,6 +521,9 @@ struct mesh_state_t {
   schedule_payload_t sched_current;       // Coordinator's current schedule (N3 / N4 failover)
   bool             sched_is_coordinator;
   uint32_t         last_sched_announce_ms;
+  schedule_payload_t last_primary_sched;  // N4: latest N3 schedule, relayed for nodes out of N3's range
+  uint32_t         last_primary_rx_ms;
+  uint32_t         last_sched_relay_ms;
 
   // Collision test flag
   volatile bool    collision_test_trigger;

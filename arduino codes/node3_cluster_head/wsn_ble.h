@@ -50,6 +50,7 @@ void ble_load_calibration() {
   if (p.begin("wsnble", true)) {
     ble_cal_A = p.getFloat("A", 0);
     ble_cal_n = p.getFloat("n", BLE_PATH_LOSS_N);
+    wsn_log_level = (uint8_t)p.getFloat("log", 1);
     p.end();
   }
 }
@@ -59,6 +60,7 @@ void ble_save_calibration() {
   if (p.begin("wsnble", false)) {
     p.putFloat("A", ble_cal_A);
     p.putFloat("n", ble_cal_n);
+    p.putFloat("log", wsn_log_level);
     p.end();
   }
 }
@@ -138,11 +140,11 @@ class WsnScanCallbacks : public NimBLEScanCallbacks {
         }
         if (len >= (int)sizeof(line)) break;
       }
-      Serial.println(line);
+      if (wsn_verbose()) Serial.println(line);
       for (int i = 1; i <= NUM_NODES; i++) {
         if (i == MY_NODE_ID) continue;
         bool now = known & (1 << i), before = ble_known_mask & (1 << i);
-        if (now && !before) Serial.printf("[BLE] Discovered N%d (RSSI %d dBm → %.2f m)\n", i, mesh.ble[i].rssi_raw, mesh.ble[i].distance_m);
+        if (now && !before) LOGE("[BLE] Discovered N%d (RSSI %d dBm → %.2f m)\n", i, mesh.ble[i].rssi_raw, mesh.ble[i].distance_m);
       }
     }
     ble_known_mask = known;
@@ -300,6 +302,32 @@ bool ble_localize(uint8_t reporter, const uint8_t ids[3], const float dists[3], 
   return true;
 }
 
+// ==================== ADVERTISING SCHEDULE ====================
+enum ble_adv_mode_t : uint8_t { BLE_ADV_CONTINUOUS, BLE_ADV_BURST_ON, BLE_ADV_BURST_OFF };
+static ble_adv_mode_t ble_adv_mode = BLE_ADV_CONTINUOUS;   // ble_init() starts continuous
+
+void ble_adv_set(ble_adv_mode_t m) {
+  if (m == ble_adv_mode || !pAdvertising) return;
+  pAdvertising->stop();
+  if (m == BLE_ADV_BURST_ON) {
+    pAdvertising->setMinInterval(BLE_ADV_BURST_INTERVAL_MS / 0.625f);
+    pAdvertising->setMaxInterval((BLE_ADV_BURST_INTERVAL_MS + 5) / 0.625f);
+    pAdvertising->start();
+  } else if (m == BLE_ADV_CONTINUOUS) {
+    pAdvertising->setMinInterval(BLE_ADV_INTERVAL_MS / 0.625f);
+    pAdvertising->setMaxInterval((BLE_ADV_INTERVAL_MS + 20) / 0.625f);
+    pAdvertising->start();
+  }
+  ble_adv_mode = m;
+}
+
+void ble_adv_tick() {
+  if (!ble_initialized) return;
+  if (!mesh.tdma.synced) { ble_adv_set(BLE_ADV_CONTINUOUS); return; }
+  bool in_sleep = tdma_current_epoch() == EPOCH_SLEEP && tdma_epoch_remaining_ms() > 3;
+  ble_adv_set(in_sleep ? BLE_ADV_BURST_ON : BLE_ADV_BURST_OFF);
+}
+
 // ==================== HOUSEKEEPING ====================
 // Forget neighbours not heard recently; start a scan burst in the SLEEP epoch.
 void ble_tick() {
@@ -310,9 +338,16 @@ void ble_tick() {
     if (bn.discovered && wsn_age_ms(bn.last_seen_ms) > BLE_NEIGHBOR_EXPIRY_MS) {
       bn.discovered = false;
       bn.rssi_filtered = 0;
-      LOGV("[BLE] N%d expired (not seen for %lu ms)\n", i, (unsigned long)wsn_age_ms(bn.last_seen_ms));
+      LOGE("[BLE] N%d expired (not seen for %lu ms)\n", i, (unsigned long)wsn_age_ms(bn.last_seen_ms));
     }
   }
+  // Advertising follows the TDMA frame once synced: bursts at a fast interval
+  // inside the SLEEP epoch only (every node scans there at the same time), so
+  // each 110 ms scan hears ~4 adverts per neighbour instead of ~2, and BLE no
+  // longer competes with Wi-Fi for the shared radio during the data slots.
+  // Unsynced nodes advertise continuously so they can still be discovered.
+  ble_adv_tick();
+
   // Scan only inside the SLEEP epoch, where no Wi-Fi traffic is scheduled
   if (mesh.tdma.synced && tdma_current_epoch() == EPOCH_SLEEP &&
       tdma_epoch_remaining_ms() > BLE_SCAN_DURATION_MS &&
@@ -367,7 +402,11 @@ void ble_print_status() {
                     i, bn.rssi_raw, bn.rssi_filtered, bn.distance_m,
                     (unsigned long)wsn_age_ms(bn.last_seen_ms));
     } else {
-      Serial.printf("  N%d: not discovered\n", i);
+      if (mesh.neighbors[i].link_alive)
+        Serial.printf("  N%d: not discovered by BLE (but Wi-Fi link up at %d dBm) → move it closer / keep antennas clear\n",
+                      i, mesh.neighbors[i].wifi_rssi);
+      else
+        Serial.printf("  N%d: not discovered\n", i);
     }
   }
   uint8_t nearest = ble_nearest_node();
@@ -420,6 +459,82 @@ bool wsn_read_serial_line(String& out) {
   return false;
 }
 
+// ==================== 5-SECOND STATUS SUMMARY ====================
+// One compact block per node every SUMMARY_PERIOD_MS so each Serial Monitor
+// stays readable. The node-specific first line comes from app_summary().
+#ifndef SUMMARY_PERIOD_MS
+#define SUMMARY_PERIOD_MS 5000
+#endif
+extern void app_summary();
+
+void wsn_print_summary() {
+  uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
+  float duty = total ? mesh.tdma.active_time_ms * 100.0f / total : 100.0f;
+  uint8_t ch = 0; wifi_second_chan_t sec; esp_wifi_get_channel(&ch, &sec);
+  Serial.printf("\n==================== N%d %s | t=%lu s ====================\n",
+                MY_NODE_ID, roleStr(mesh.my_role), (unsigned long)(millis() / 1000));
+  app_summary();
+  char mine[40] = "";
+  for (uint8_t e = EPOCH_SLOT1; e <= EPOCH_SLOT4; e++) {
+    char part[12];
+    if (mesh.tdma.my_tx_slots_mask & (1 << e)) { snprintf(part, sizeof(part), "%s:TX ", epochStr(e)); strncat(mine, part, sizeof(mine) - strlen(mine) - 1); }
+    if (mesh.tdma.my_relay_slots_mask & (1 << e)) { snprintf(part, sizeof(part), "%s:RELAY ", epochStr(e)); strncat(mine, part, sizeof(mine) - strlen(mine) - 1); }
+  }
+  Serial.printf(" TDMA  : %s (%s) ch %d | frame %lu | schedule v%u by N%d \"%s\" | my slots %s| duty %.0f%%\n",
+                mesh.tdma.synced ? "SYNCED" : "NOT SYNCED (scanning)",
+                mesh.tdma.synced_from_beacon ? "beacon" : "via neighbour", ch,
+                (unsigned long)tdma_current_frame(), mesh.tdma.sched_version, mesh.tdma.sched_issuer,
+                mesh.tdma.sched_reason, mine[0] ? mine : (MY_NODE_ID == SINK_ID ? "(sink listens) " : "none→CAP "), duty);
+  if (MY_NODE_ID != SINK_ID) {
+    Serial.printf(" ROUTE : next hop %s (hops to sink %d, cost %.1f) |",
+                  mesh.next_hop_to_sink ? nodeIdStr(mesh.next_hop_to_sink) : "NONE", routing_my_hops(),
+                  mesh.next_hop_cost >= ROUTE_INFINITY ? 0.0f : mesh.next_hop_cost);
+  } else {
+    Serial.printf(" ROUTE : sink (root, hops 0) |");
+  }
+  for (int i = 1; i <= NUM_NODES; i++) {
+    if (i == MY_NODE_ID) continue;
+    route_neighbor_t& nb = mesh.neighbors[i];
+    if (nb.link_alive && nb.ack_sent > 0) Serial.printf(" N%d up %d dBm ACK %.0f%% |", i, nb.wifi_rssi, nb.ack_success_rate * 100);
+    else if (nb.link_alive)              Serial.printf(" N%d up %d dBm ACK n/a |", i, nb.wifi_rssi);
+    else               Serial.printf(" N%d %s |", i, mesh.killed_links[i] ? "KILLED" : "down");
+  }
+  Serial.println();
+  Serial.printf(" MAC   : sent %lu, ACK ok %lu, retransmit %lu, ACK timeout %lu, dropped %lu | CCA busy %lu, backoffs %lu, deferred %lu | forwarded %lu, dup %lu | radio-level fails %lu\n",
+                (unsigned long)mesh.mac_stats.total_tx_attempts, (unsigned long)mesh.mac_stats.total_acks_ok,
+                (unsigned long)mesh.mac_stats.total_retries, (unsigned long)mesh.mac_stats.total_acks_timeout,
+                (unsigned long)mesh.mac_stats.total_drops, (unsigned long)mesh.mac_stats.cca_busy_count,
+                (unsigned long)mesh.mac_stats.total_backoffs, (unsigned long)mesh.mac_stats.total_deferrals,
+                (unsigned long)mesh.pkts_forwarded, (unsigned long)mesh.mac_stats.dup_rx,
+                (unsigned long)mesh.mac_stats.ll_fail);
+  Serial.printf(" BLE   :");
+  for (int i = 1; i <= NUM_NODES; i++) {
+    if (i == MY_NODE_ID) continue;
+    ble_neighbor_t& bn = mesh.ble[i];
+    if (bn.discovered) Serial.printf(" N%d %.0f dBm→%.1f m |", i, bn.rssi_filtered, bn.distance_m);
+    else if (mesh.neighbors[i].link_alive)
+                       Serial.printf(" N%d not heard by BLE (Wi-Fi %d dBm: too far/blocked for BLE) |", i, mesh.neighbors[i].wifi_rssi);
+    else               Serial.printf(" N%d not heard yet |", i);
+  }
+  uint8_t nearest = ble_nearest_node();
+  ble_report_payload_t rpt = ble_build_report();
+  if (rpt.error_m >= 0) {
+    Serial.printf(" nearest %s | position (%.2f, %.2f) error %.2f m\n", nearest ? nodeIdStr(nearest) : "-",
+                  rpt.est_x, rpt.est_y, rpt.error_m);
+  } else {
+    Serial.printf(" nearest %s | position needs 3 neighbours\n", nearest ? nodeIdStr(nearest) : "-");
+  }
+  Serial.println("=====================================================================");
+}
+
+void wsn_summary_tick() {
+  static uint32_t last = 0;
+  if (millis() - last >= SUMMARY_PERIOD_MS) {
+    last = millis();
+    wsn_print_summary();
+  }
+}
+
 // BLE commands available on every node:
 //   ble              → print BLE status (RSSI, distances, nearest, localization)
 //   cal <id> <m>     → place node <id> exactly <m> metres away, then run: sets A(1 m)
@@ -428,6 +543,18 @@ bool wsn_read_serial_line(String& out) {
 //   blereset         → back to defaults
 // Returns true if the command was a BLE command.
 bool ble_command(const String& cmd) {
+  if (cmd.startsWith("log")) {
+    int lv = cmd.length() > 4 ? cmd.substring(4).toInt() : -1;
+    if (lv < 0 || lv > 2) {
+      Serial.println("[LOG] Usage: log 0 (5 s summaries only) | log 1 (summaries + events, default) | log 2 (full packet trace)");
+      return true;
+    }
+    wsn_log_level = (uint8_t)lv;
+    ble_save_calibration();
+    Serial.printf("[LOG] Log level %d — %s (saved)\n", lv,
+                  lv == 0 ? "summaries only" : (lv == 1 ? "summaries + events" : "full packet trace"));
+    return true;
+  }
   if (cmd == "ble") {
     ble_print_status();
     return true;
@@ -485,7 +612,7 @@ void ble_serial_poll() {
   if (!wsn_read_serial_line(cmd)) return;
   if (cmd == "status") { mesh_print_status(); ble_print_status(); return; }
   if (!ble_command(cmd)) {
-    Serial.printf("[CMD] Unknown '%s'. Commands: status | ble | cal <id> <m> | setn <n> | seta <dBm> | blereset\n", cmd.c_str());
+    Serial.printf("[CMD] Unknown '%s'. Commands: status | log 0/1/2 | ble | cal <id> <m> | setn <n> | seta <dBm> | blereset\n", cmd.c_str());
   }
 }
 
