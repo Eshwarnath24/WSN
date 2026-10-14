@@ -1,39 +1,50 @@
 // ==================== WSN MESH PROTOCOL STACK ====================
-// Full mesh stack: MAC (CCA + BEB + ACK), Routing (neighbor table +
-// distance-vector + forwarding), TDMA (sync + slot engine + sleep).
+// Full mesh stack: MAC (CCA + random backoff + ACK + retransmission),
+// Routing (neighbour table + distance-vector with poison reverse +
+// forwarding + failure detection/recovery), TDMA (sync + slot engine +
+// schedule distribution + sleep accounting).
 //
 // This file is header-only. Include it after wsn_common.h.
-// Every node compiles the same code; role-specific behavior is
+// Every node compiles the same code; role-specific behaviour is
 // controlled by MY_NODE_ID and NODE_ROLES[MY_NODE_ID].
+//
+// Concurrency: ESP-NOW callbacks run in the Wi-Fi task, loop() runs in the
+// Arduino task. Shared queues/caches are protected by mesh_mux (short
+// critical sections, never around Serial output).
 // =================================================================
 #ifndef WSN_MESH_H
 #define WSN_MESH_H
 
 #include "wsn_common.h"
+#if WSN_ENABLE_LIGHT_SLEEP
+#include "esp_sleep.h"
+#endif
 
 // ==================== GLOBAL MESH STATE ====================
 // Single instance per node (one compilation unit per Arduino sketch)
 mesh_state_t mesh;
+portMUX_TYPE mesh_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // ==================== FORWARD DECLARATIONS ====================
 void mesh_handle_data(const wsn_packet_t& pkt, int rssi);
 void mesh_handle_ack(const wsn_packet_t& pkt);
 void mesh_handle_hello(const wsn_packet_t& pkt, int rssi);
-void mesh_handle_beacon(const wsn_packet_t& pkt);
+void mesh_handle_beacon(const wsn_packet_t& pkt, int rssi);
 void mesh_handle_schedule(const wsn_packet_t& pkt);
 void mesh_handle_route_update(const wsn_packet_t& pkt);
 void mesh_handle_ctrl(const wsn_packet_t& pkt);
-void mesh_handle_ble_report(const wsn_packet_t& pkt);
+void mesh_handle_ble_report(const wsn_packet_t& pkt, int rssi);
 void mesh_handle_agg(const wsn_packet_t& pkt, int rssi);
 
-// Routing & MAC layer forward declarations
 void routing_recompute_next_hop();
+void routing_mark_link_dead(uint8_t nb, const char* reason);
 void routing_send_hello();
-bool routing_forward(wsn_packet_t pkt);
 void routing_check_timeouts();
-bool mac_send(wsn_packet_t& pkt);
+mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms);
+bool mac_send_broadcast(wsn_packet_t& pkt, bool log);
 void mac_send_ack(const wsn_packet_t& received_pkt);
 bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt);
+void tdma_apply_schedule(const schedule_payload_t& sp, bool local);
 
 // Application-level callbacks (implemented in each node's .ino)
 extern void app_on_data_for_me(const wsn_packet_t& pkt, int rssi);
@@ -43,12 +54,132 @@ extern void app_on_ctrl(ctrl_cmd_t cmd, uint8_t p1, uint8_t p2);
 // Return FALSE to let the mesh layer forward it normally.
 extern bool app_on_data_transit(const wsn_packet_t& pkt, int rssi);
 
-// ==================== ESP-NOW RAW SEND HELPER ====================
-// Low-level send — no CCA, no ACK, no retry. Used internally.
+// =====================================================================
+//                     TIME / EPOCH HELPERS
+// =====================================================================
+static const uint16_t EPOCH_END_MS[7] = {
+  BEACON_START_MS + BEACON_DURATION_MS, CAP_START_MS + CAP_DURATION_MS,
+  SLOT1_START_MS + SLOT1_DURATION_MS,   SLOT2_START_MS + SLOT2_DURATION_MS,
+  SLOT3_START_MS + SLOT3_DURATION_MS,   SLOT4_START_MS + SLOT4_DURATION_MS,
+  SUPERFRAME_MS
+};
+
+uint32_t tdma_synced_time() {
+  return millis() + mesh.tdma.clock_offset;
+}
+
+tdma_epoch_t tdma_epoch_at(uint32_t t_in_frame) {
+  for (uint8_t e = EPOCH_BEACON; e <= EPOCH_SLEEP; e++) {
+    if (t_in_frame < EPOCH_END_MS[e]) return (tdma_epoch_t)e;
+  }
+  return EPOCH_SLEEP;
+}
+
+// --- Current epoch within superframe ---
+tdma_epoch_t tdma_current_epoch() {
+  if (!mesh.tdma.synced) return EPOCH_CAP;  // Unsynced: contention-only operation
+  return tdma_epoch_at(tdma_synced_time() % SUPERFRAME_MS);
+}
+
+// --- Frame number derived from the synchronised clock (identical on all nodes) ---
+uint32_t tdma_current_frame() {
+  return mesh.tdma.synced ? (tdma_synced_time() / SUPERFRAME_MS) : 0;
+}
+
+// --- Time remaining in current epoch (ms) ---
+uint32_t tdma_epoch_remaining_ms() {
+  if (!mesh.tdma.synced) return 1000;
+  uint32_t t = tdma_synced_time() % SUPERFRAME_MS;
+  uint32_t end = EPOCH_END_MS[tdma_epoch_at(t)];
+  return (end > t) ? (end - t) : 0;
+}
+
+// --- Local millis() deadline for transmissions in the current epoch ---
+uint32_t tdma_epoch_deadline() {
+  uint32_t r = tdma_epoch_remaining_ms();
+  return millis() + ((r > GUARD_MS) ? (r - GUARD_MS) : 0);
+}
+
+// --- Is this my TX slot? (Transmitting own data) ---
+bool tdma_is_my_tx_slot() {
+  if (!mesh.tdma.synced) return true;  // Unsynced: free running
+  return (mesh.tdma.my_tx_slots_mask & (1 << tdma_current_epoch())) != 0;
+}
+
+// --- Is this my RELAY slot? (Forwarding queued transit packets) ---
+bool tdma_is_my_relay_slot() {
+  if (!mesh.tdma.synced) return true;
+  return (mesh.tdma.my_relay_slots_mask & (1 << tdma_current_epoch())) != 0;
+}
+
+bool tdma_is_sleep_epoch() {
+  return tdma_current_epoch() == EPOCH_SLEEP;
+}
+
+// Window for control traffic (HELLO, schedule, route updates, BLE reports, retries)
+bool mesh_ctrl_window_open() {
+  return !mesh.tdma.synced || tdma_current_epoch() == EPOCH_CAP;
+}
+
+// Window for NEW own data: own TX slot, or CAP if this node has no slot
+// (schedule not received yet, or slot released by the coordinator).
+bool mesh_data_window_open() {
+  if (!mesh.tdma.synced) return true;
+  if (tdma_is_my_tx_slot()) return true;
+  bool no_slot = !mesh.tdma.schedule_received || mesh.tdma.my_tx_slots_mask == 0;
+  return no_slot && tdma_current_epoch() == EPOCH_CAP;
+}
+
+// Window for retransmitting a pending own packet: own slot or CAP
+bool mesh_retry_window_open() {
+  return mesh_data_window_open() || mesh_ctrl_window_open();
+}
+
+// Identifies one transmission opportunity (one slot occurrence) so that a node
+// generates at most one new packet per opportunity. Unsynced: once per second.
+uint32_t mesh_tx_opportunity_key() {
+  if (!mesh.tdma.synced) return 0x80000000UL | (millis() / 1000);
+  return tdma_current_frame() * 8 + tdma_current_epoch();
+}
+
+// =====================================================================
+//                     DUPLICATE SUPPRESSION
+// =====================================================================
+// Returns true if (type, origin, seq) was already seen recently; otherwise
+// records it. Used so a retransmission after a lost ACK is re-ACKed but not
+// processed/forwarded/aggregated twice.
+bool mesh_seen_before(uint8_t type, uint8_t origin, uint16_t seq) {
+  uint32_t now = millis();
+  bool dup = false;
+  portENTER_CRITICAL(&mesh_mux);
+  for (int i = 0; i < DUP_CACHE_SIZE; i++) {
+    dup_entry_t& e = mesh.dup_cache[i];
+    if (e.t_ms != 0 && e.type == type && e.origin == origin && e.seq == seq &&
+        (now - e.t_ms) < DUP_CACHE_TTL_MS) {
+      dup = true;
+      break;
+    }
+  }
+  if (!dup) {
+    dup_entry_t& e = mesh.dup_cache[mesh.dup_next];
+    e.type = type; e.origin = origin; e.seq = seq; e.t_ms = now ? now : 1;
+    mesh.dup_next = (mesh.dup_next + 1) % DUP_CACHE_SIZE;
+  }
+  portEXIT_CRITICAL(&mesh_mux);
+  return dup;
+}
+
+// =====================================================================
+//                     ESP-NOW RAW SEND HELPER
+// =====================================================================
+// Low-level send — no CCA, no ACK, no retry. Sends header + payload_len bytes.
 bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt) {
   const uint8_t* mac;
   if (dst_id == BROADCAST_ID) {
     mac = BROADCAST_MAC;
+  } else if (dst_id < 1 || dst_id > NUM_NODES) {
+    Serial.printf("[ESP-NOW] Invalid destination id %d\n", dst_id);
+    return false;
   } else if (mesh.peer_macs[dst_id][0] != 0 || mesh.peer_macs[dst_id][1] != 0) {
     mac = mesh.peer_macs[dst_id];
   } else {
@@ -64,7 +195,7 @@ bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt) {
     esp_now_add_peer(&peer);
   }
 
-  esp_err_t result = esp_now_send(mac, (const uint8_t*)&pkt, sizeof(wsn_packet_t));
+  esp_err_t result = esp_now_send(mac, (const uint8_t*)&pkt, wsn_wire_len(pkt));
   if (result != ESP_OK) {
     Serial.printf("[ESP-NOW] Raw send FAILED to %s (err=%d)\n", nodeIdStr(dst_id), result);
     return false;
@@ -75,160 +206,171 @@ bool espnow_raw_send(uint8_t dst_id, const wsn_packet_t& pkt) {
 // =====================================================================
 //                          MAC LAYER
 // =====================================================================
+// Application-level CSMA/CA on top of ESP-NOW:
+//   1. channel sensing (software CCA: WSN frames sniffed in promiscuous mode)
+//   2. random backoff in [0, CW-1] slots (CW doubles per attempt: BEB)
+//   3. re-sense: if a WSN frame was heard during the backoff → defer, retry
+//   4. transmit, wait for application ACK (matched on seq+origin+type+sender)
+//   5. ACK timeout → retransmit (max MAC_MAX_ATTEMPTS attempts in total)
+// The ESP32 Wi-Fi hardware additionally runs 802.11 DCF below ESP-NOW;
+// the steps above are the custom, observable application-level MAC.
 
 // --- Software Clear Channel Assessment (CCA) ---
-// Returns true if channel appears idle.
-bool mac_cca() {
-  if (millis() - mesh.last_rx_time_ms < CCA_BUSY_THRESHOLD_MS) {
+bool mac_channel_busy(uint32_t since_ms) {
+  uint32_t last = mesh.last_rx_time_ms;
+  if (since_ms != 0 && (int32_t)(last - since_ms) >= 0) return true;  // heard during backoff
+  return (millis() - last) < CCA_BUSY_THRESHOLD_MS;
+}
+
+bool mac_cca(uint32_t since_ms = 0) {
+  if (mac_channel_busy(since_ms)) {
     mesh.mac_stats.cca_busy_count++;
-    Serial.printf("[MAC] CCA: BUSY (frame seen %lu ms ago)\n",
-                  millis() - mesh.last_rx_time_ms);
+    Serial.printf("[MAC] CCA: BUSY (WSN frame sniffed %lu ms ago)\n",
+                  (unsigned long)(millis() - mesh.last_rx_time_ms));
     return false;
   }
   return true;
 }
 
-// --- Binary Exponential Backoff ---
-void mac_backoff() {
-  uint8_t slots = random(0, mesh.current_cw);
+// --- Random backoff with the given contention window ---
+uint32_t mac_backoff(uint8_t cw) {
+  uint8_t slots = random(0, cw);
   uint32_t wait_ms = slots * BACKOFF_SLOT_MS;
   mesh.mac_stats.total_backoffs++;
-  Serial.printf("[MAC] Backoff: CW=%d slots=%d wait=%lu ms\n",
-                mesh.current_cw, slots, wait_ms);
-  delay(wait_ms);
-  // Double the contention window
-  mesh.current_cw = min((int)(mesh.current_cw * 2), (int)CW_MAX);
+  Serial.printf("[MAC] Backoff: CW=%d slots=%d wait=%lu ms\n", cw, slots, (unsigned long)wait_ms);
+  if (wait_ms) delay(wait_ms);
+  return wait_ms;
 }
 
-// --- Send with CSMA/CA + Application-Level ACK ---
-// Returns true if ACK received (unicast) or send succeeded (broadcast).
-// This function is BLOCKING during the send+ACK window.
-bool mac_send(wsn_packet_t& pkt) {
-  bool is_broadcast = (pkt.dst_id == BROADCAST_ID);
-  mesh.current_cw = CW_MIN;
+// --- Broadcast with channel sensing (no ACK by definition) ---
+bool mac_send_broadcast(wsn_packet_t& pkt, bool log) {
+  pkt.src_id = MY_NODE_ID;
+  pkt.dst_id = BROADCAST_ID;
+  if (mac_channel_busy(0)) {
+    mesh.mac_stats.cca_busy_count++;
+    mac_backoff(CW_MIN);
+  }
+  if (log) logPacket("TX", pkt);
+  mesh.pkts_sent++;
+  return espnow_raw_send(BROADCAST_ID, pkt);
+}
 
-  for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    // 1. Clear Channel Assessment
-    if (!mac_cca()) {
-      mac_backoff();
-      // Re-check CCA after backoff
-      if (!mac_cca()) {
-        // Still busy — count as retry if unicast
-        if (!is_broadcast) {
-          mesh.mac_stats.total_retries++;
-          Serial.printf("[MAC] CCA still busy after backoff (attempt %d/%d)\n",
-                        attempt + 1, MAX_RETRIES + 1);
-          continue;
-        }
-      }
+// --- Unicast with CSMA/CA + application ACK + retransmission ---
+// attempts: attempts already used for this packet (kept by the caller so a
+//           packet can continue in the next slot/CAP after MAC_DEFERRED)
+// deadline_ms: local millis() by which the exchange must be complete
+mac_result_t mac_send(wsn_packet_t& pkt, uint8_t& attempts, uint32_t deadline_ms) {
+  if (pkt.dst_id == BROADCAST_ID) {
+    return mac_send_broadcast(pkt, true) ? MAC_OK : MAC_DROPPED;
+  }
+  pkt.src_id = MY_NODE_ID;
+  uint8_t busy_rounds = 0;
+
+  while (attempts < MAC_MAX_ATTEMPTS) {
+    if (pkt.dst_id < 1 || pkt.dst_id > NUM_NODES) return MAC_NO_ROUTE;
+
+    uint8_t exp = attempts + busy_rounds;
+    if (exp > 4) exp = 4;
+    uint8_t cw = (uint8_t)min((int)(CW_MIN << exp), (int)CW_MAX);
+    mesh.current_cw = cw;
+
+    // Slot boundary: the whole exchange (backoff + frame + ACK wait) must fit
+    int32_t left = (int32_t)(deadline_ms - millis());
+    int32_t need = (cw - 1) * BACKOFF_SLOT_MS + ACK_TIMEOUT_MS + 2;
+    if (left < need) {
+      mesh.mac_stats.total_deferrals++;
+      Serial.printf("[MAC] DEFER seq=%d: %ld ms left in %s < %ld ms needed → continue in next slot/CAP\n",
+                    pkt.seq_num, (long)(left > 0 ? left : 0), epochStr(tdma_current_epoch()), (long)need);
+      return MAC_DEFERRED;
     }
 
-    // 2. Set up ACK expectation (unicast only)
-    if (!is_broadcast) {
-      mesh.ack_pending = true;
-      mesh.ack_expected_seq = pkt.seq_num;
-      mesh.ack_expected_origin = pkt.origin_id;
-      mesh.ack_received = false;
+    // 1. Channel sensing
+    bool idle = mac_cca();
+    Serial.printf("[MAC] CSMA %s seq=%d → N%d attempt %d/%d: channel %s\n",
+                  msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.dst_id,
+                  attempts + 1, MAC_MAX_ATTEMPTS, idle ? "IDLE" : "BUSY");
+
+    // 2. Random backoff (always, so simultaneous senders de-synchronise)
+    uint32_t bo_start = millis();
+    mac_backoff(idle ? cw : (uint8_t)min((int)cw * 2, (int)CW_MAX));
+
+    // 3. Re-sense after backoff: someone else won the contention → defer
+    if (!mac_cca(bo_start)) {
+      busy_rounds++;
+      Serial.printf("[MAC] Contention: channel taken during backoff → defer seq=%d (CW doubles)\n",
+                    pkt.seq_num);
+      continue;
     }
 
-    // 3. Transmit
-    pkt.src_id = MY_NODE_ID;  // Always set src to us (for forwarded packets)
+    // 4. Arm ACK expectation
+    mesh.ack_expected_seq    = pkt.seq_num;
+    mesh.ack_expected_origin = pkt.origin_id;
+    mesh.ack_expected_type   = pkt.msg_type;
+    mesh.ack_expected_from   = pkt.dst_id;
+    mesh.ack_received        = false;
+    mesh.ack_pending         = true;
+
+    // 5. Transmit
+    attempts++;
+    mesh.mac_stats.total_tx_attempts++;
+    if (attempts > 1) {
+      mesh.mac_stats.total_retries++;
+      Serial.printf("[MAC] RETRANSMIT seq=%d to N%d (attempt %d/%d)\n",
+                    pkt.seq_num, pkt.dst_id, attempts, MAC_MAX_ATTEMPTS);
+    }
     logPacket("TX", pkt);
     bool sent = espnow_raw_send(pkt.dst_id, pkt);
     mesh.pkts_sent++;
 
-    if (!sent) {
-      mesh.ack_pending = false;
-      if (!is_broadcast) {
-        mesh.mac_stats.total_retries++;
-        mac_backoff();
-        continue;
-      }
-      return false;
-    }
-
-    // 4. For broadcast: no ACK needed, done
-    if (is_broadcast) {
-      return true;
-    }
-
-    // 5. Wait for application-level ACK
     uint32_t ack_start = millis();
-    while (!mesh.ack_received && (millis() - ack_start) < ACK_TIMEOUT_MS) {
-      delayMicroseconds(200);
+    if (sent) {
+      while (!mesh.ack_received && (millis() - ack_start) < ACK_TIMEOUT_MS) {
+        delayMicroseconds(200);
+      }
     }
     mesh.ack_pending = false;
 
+    uint8_t nb = pkt.dst_id;
+    route_neighbor_t& n = mesh.neighbors[nb];
+    n.ack_sent++;
+
     if (mesh.ack_received) {
-      // ACK received — success!
       uint32_t rtt = millis() - ack_start;
       mesh.mac_stats.total_acks_ok++;
-      mesh.current_cw = CW_MIN;  // Reset CW on success
-
-      // Update neighbor ACK stats
-      uint8_t nb = pkt.dst_id;
-      if (nb >= 1 && nb <= NUM_NODES) {
-        mesh.neighbors[nb].ack_sent++;
-        mesh.neighbors[nb].ack_received++;
-        mesh.neighbors[nb].consec_ack_fails = 0;
-        // EWMA ACK success rate
-        float rate = (float)mesh.neighbors[nb].ack_received / mesh.neighbors[nb].ack_sent;
-        mesh.neighbors[nb].ack_success_rate =
-          0.3f * rate + 0.7f * mesh.neighbors[nb].ack_success_rate;
-      }
-
-      Serial.printf("[MAC] ACK OK for seq=%d from N%d (RTT=%lu ms)\n",
-                    pkt.seq_num, pkt.dst_id, rtt);
-      return true;
+      n.ack_received++;
+      n.consec_ack_fails = 0;
+      n.ack_success_rate = 0.2f * 1.0f + 0.8f * n.ack_success_rate;
+      Serial.printf("[MAC] ACK OK seq=%d from N%d (RTT=%lu ms, attempt %d)\n",
+                    pkt.seq_num, nb, (unsigned long)rtt, attempts);
+      return MAC_OK;
     }
 
-    // 6. ACK timeout — retry
+    // 6. ACK timeout
     mesh.mac_stats.total_acks_timeout++;
-    mesh.mac_stats.total_retries++;
-    Serial.printf("[MAC] ACK TIMEOUT seq=%d → retry %d/%d\n",
-                  pkt.seq_num, attempt + 1, MAX_RETRIES);
+    n.consec_ack_fails++;
+    n.ack_success_rate = 0.8f * n.ack_success_rate;
+    Serial.printf("[MAC] ACK TIMEOUT seq=%d from N%d after %d ms (attempt %d/%d, consecutive=%d)\n",
+                  pkt.seq_num, nb, ACK_TIMEOUT_MS, attempts, MAC_MAX_ATTEMPTS, n.consec_ack_fails);
 
-    // Update neighbor failure stats (EWMA)
-    uint8_t nb2 = pkt.dst_id;
-    if (nb2 >= 1 && nb2 <= NUM_NODES) {
-      mesh.neighbors[nb2].ack_sent++;
-      float rate = (float)mesh.neighbors[nb2].ack_received / mesh.neighbors[nb2].ack_sent;
-      mesh.neighbors[nb2].ack_success_rate =
-        0.3f * rate + 0.7f * mesh.neighbors[nb2].ack_success_rate;
-    }
-
-    mac_backoff();
-  }
-
-  // All retries exhausted — report packet dropped
-  mesh.mac_stats.total_drops++;
-  uint8_t nb3 = pkt.dst_id;
-  Serial.printf("[MAC] DROPPED seq=%d to N%d after %d retries\n",
-                pkt.seq_num, nb3, MAX_RETRIES + 1);
-
-  // Check if this neighbor should be marked dead (count DROPPED packets, not retries)
-  if (nb3 >= 1 && nb3 <= NUM_NODES) {
-    mesh.neighbors[nb3].consec_ack_fails++;
-    if (mesh.neighbors[nb3].consec_ack_fails >= LINK_FAIL_THRESHOLD) {
-      if (mesh.neighbors[nb3].link_alive) {
-        mesh.neighbors[nb3].link_alive = false;
-        Serial.printf("[ROUTE] *** Link N%d→N%d DEAD (%d consecutive dropped packets) ***\n",
-                      MY_NODE_ID, nb3, mesh.neighbors[nb3].consec_ack_fails);
-
-        // Broadcast route update
-        wsn_packet_t rupkt;
-        initPacket(rupkt, MSG_ROUTE_UPDATE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, mesh.ctrl_seq_counter++);
-        route_update_payload_t ru = { MY_NODE_ID, nb3, false };
-        setPayload(rupkt, ru);
-        espnow_raw_send(BROADCAST_ID, rupkt);
-
-        // Recompute routes
-        routing_recompute_next_hop();
+    // Failure detection: repeated ACK timeouts → link dead → reroute this packet
+    if (n.consec_ack_fails >= LINK_FAIL_ACK_TIMEOUTS && n.link_alive) {
+      routing_mark_link_dead(nb, "consecutive ACK timeouts");
+      uint8_t alt = mesh.next_hop_to_sink;
+      if (pkt.final_dst_id == SINK_ID && alt != 0 && alt != nb) {
+        pkt.dst_id = alt;
+        mesh.mac_stats.total_reroutes++;
+        if (attempts > MAC_MAX_ATTEMPTS - 2) attempts = MAC_MAX_ATTEMPTS - 2;
+        Serial.printf("[ROUTE] Re-routing seq=%d (origin N%d) via ALTERNATE next hop N%d\n",
+                      pkt.seq_num, pkt.origin_id, alt);
       }
     }
   }
 
-  return false;
+  // All attempts used
+  mesh.mac_stats.total_drops++;
+  Serial.printf("[MAC] DROPPED seq=%d to N%d after %d attempts\n",
+                pkt.seq_num, pkt.dst_id, MAC_MAX_ATTEMPTS);
+  return MAC_DROPPED;
 }
 
 // --- Send an ACK for a received unicast packet ---
@@ -236,10 +378,11 @@ void mac_send_ack(const wsn_packet_t& received_pkt) {
   wsn_packet_t ack;
   initPacket(ack, MSG_ACK, received_pkt.src_id, MY_NODE_ID, received_pkt.src_id, 0);
   ack_payload_t ap;
-  ap.acked_seq_num = received_pkt.seq_num;
+  ap.acked_seq_num   = received_pkt.seq_num;
   ap.acked_origin_id = received_pkt.origin_id;
+  ap.acked_type      = received_pkt.msg_type;
   setPayload(ack, ap);
-  // ACKs are sent raw (no CCA/retry to avoid recursion)
+  // ACKs are sent immediately and raw (they are part of the sender's exchange)
   espnow_raw_send(received_pkt.src_id, ack);
 }
 
@@ -247,63 +390,82 @@ void mac_send_ack(const wsn_packet_t& received_pkt) {
 //                        ROUTING LAYER
 // =====================================================================
 
-// Forward declaration (used by routing_recompute)
-void routing_recompute_next_hop();
-
-// --- Initialize neighbor table ---
+// --- Initialize neighbour table ---
 void routing_init() {
   for (int i = 0; i <= NUM_NODES; i++) {
     mesh.neighbors[i].node_id = i;
     mesh.neighbors[i].wifi_rssi = -100;
     mesh.neighbors[i].ack_success_rate = 0.5f;
-    mesh.neighbors[i].hops_to_sink = 255;
+    mesh.neighbors[i].hops_to_sink = HOPS_INFINITY;
+    mesh.neighbors[i].next_hop = 0;
     mesh.neighbors[i].last_hello_ms = 0;
     mesh.neighbors[i].link_alive = false;
     mesh.neighbors[i].ack_sent = 0;
     mesh.neighbors[i].ack_received = 0;
     mesh.neighbors[i].consec_ack_fails = 0;
   }
-  // Sink knows it's 0 hops from itself
-  if (MY_NODE_ID == 4) {
-    mesh.neighbors[4].hops_to_sink = 0;
-    mesh.neighbors[4].link_alive = true;
-    mesh.next_hop_to_sink = 4;  // We ARE the sink
+  if (MY_NODE_ID == SINK_ID) {
+    mesh.neighbors[SINK_ID].hops_to_sink = 0;
+    mesh.neighbors[SINK_ID].link_alive = true;
+    mesh.next_hop_to_sink = SINK_ID;  // We ARE the sink
   }
 }
 
-// --- Compute route cost to reach sink through neighbor i ---
+uint8_t routing_my_hops() {
+  if (MY_NODE_ID == SINK_ID) return 0;
+  uint8_t nh = mesh.next_hop_to_sink;
+  if (nh == 0) return HOPS_INFINITY;
+  uint8_t h = mesh.neighbors[nh].hops_to_sink;
+  return (h >= HOPS_INFINITY - 1) ? HOPS_INFINITY : h + 1;
+}
+
+// Cluster head N3 can be used by N1/N2 (alive, has a route, not routing via us)
+bool routing_cluster_head_usable() {
+  route_neighbor_t& c = mesh.neighbors[CLUSTER_HEAD_ID];
+  return c.link_alive && !mesh.killed_links[CLUSTER_HEAD_ID] &&
+         c.hops_to_sink != HOPS_INFINITY && c.next_hop != MY_NODE_ID;
+}
+
+// --- Compute route cost to reach sink through neighbour i ---
+// Metrics: hop count, ETX (from ACK success rate), Wi-Fi RSSI, link availability.
 float routing_cost(uint8_t neighbor_id) {
   route_neighbor_t& n = mesh.neighbors[neighbor_id];
-  if (!n.link_alive || n.hops_to_sink == 255) return 9999.0f;
-  float etx = (n.ack_success_rate > 0.01f) ? (1.0f / n.ack_success_rate) : 100.0f;
+  if (!n.link_alive || mesh.killed_links[neighbor_id] || n.hops_to_sink == HOPS_INFINITY) {
+    return ROUTE_INFINITY;
+  }
+  // Poison reverse / split horizon: a neighbour whose route goes through us
+  // must not be used, otherwise a two-node loop forms (N3↔N1 after N3–N4 fails).
+  if (neighbor_id != SINK_ID && n.next_hop == MY_NODE_ID) return ROUTE_INFINITY;
+
+  float etx = (n.ack_success_rate > 0.05f) ? (1.0f / n.ack_success_rate) : 20.0f;
   float rssi_norm = (float)(-n.wifi_rssi) / 100.0f;
   float cost = ROUTE_COST_W_HOP * (n.hops_to_sink + 1) +
                ROUTE_COST_W_ETX * etx +
                ROUTE_COST_W_RSSI * rssi_norm;
 
-  // Cluster mesh preference (Defect 2 fix):
-  // N1 & N2 prefer routing through Cluster Head N3 for aggregation.
-  // Direct link to N4 has +10.0 penalty while N3 is alive.
-  // If N3 fails, penalty disappears and nodes immediately failover directly to N4!
-  if ((MY_NODE_ID == 1 || MY_NODE_ID == 2) && neighbor_id == 4 && mesh.neighbors[3].link_alive) {
-    cost += 10.0f;
+  // Cluster preference: N1 & N2 route through cluster head N3 for aggregation
+  // while N3 is usable; the penalty disappears when N3 fails → direct failover.
+  if ((MY_NODE_ID == 1 || MY_NODE_ID == 2) && neighbor_id == SINK_ID && routing_cluster_head_usable()) {
+    cost += ROUTE_CLUSTER_PENALTY;
+  }
+  // Prefer the designated relay (N2) over the leaf sensor (N1) as an intermediate hop
+  if (neighbor_id != SINK_ID && NODE_ROLES[neighbor_id] == ROLE_SENSOR) {
+    cost += ROUTE_LEAF_RELAY_BIAS;
   }
   return cost;
 }
 
 // --- Recompute best next hop toward the sink ---
 void routing_recompute_next_hop() {
-  if (MY_NODE_ID == 4) {
-    mesh.next_hop_to_sink = 4;
+  if (MY_NODE_ID == SINK_ID) {
+    mesh.next_hop_to_sink = SINK_ID;
     return;
   }
 
-  float best_cost = 9999.0f;
+  float best_cost = ROUTE_INFINITY;
   uint8_t best_hop = 0;
-
   for (int i = 1; i <= NUM_NODES; i++) {
     if (i == MY_NODE_ID) continue;
-    if (mesh.killed_links[i]) continue;  // Software-killed link
     float c = routing_cost(i);
     if (c < best_cost) {
       best_cost = c;
@@ -311,13 +473,52 @@ void routing_recompute_next_hop() {
     }
   }
 
-  if (best_hop != mesh.next_hop_to_sink && best_hop != 0) {
-    Serial.printf("[ROUTE] Next hop changed: N%d → N%d (cost=%.2f)\n",
-                  mesh.next_hop_to_sink, best_hop, best_cost);
-    mesh.next_hop_to_sink = best_hop;
-  } else if (best_hop == 0) {
-    Serial.println("[ROUTE] WARNING: No route to sink!");
-    mesh.next_hop_to_sink = 0;
+  uint8_t old = mesh.next_hop_to_sink;
+  mesh.next_hop_to_sink = best_hop;
+  mesh.next_hop_cost = best_cost;
+  if (best_hop != old) {
+    if (best_hop != 0) {
+      Serial.printf("[ROUTE] Next hop changed: %s → N%d (cost=%.2f, hops_to_sink=%d)\n",
+                    old ? nodeIdStr(old) : "none", best_hop, best_cost, routing_my_hops());
+    } else {
+      Serial.println("[ROUTE] WARNING: No route to sink!");
+    }
+    mesh.hello_triggered = true;  // Announce the new route quickly (triggered update)
+  }
+}
+
+void routing_queue_route_update(uint8_t a, uint8_t b, bool up) {
+  mesh.route_update_payload.node_a = a;
+  mesh.route_update_payload.node_b = b;
+  mesh.route_update_payload.link_up = up ? 1 : 0;
+  mesh.route_update_pending = true;
+}
+
+// --- Failure detection outcome: mark link dead, announce, reroute ---
+void routing_mark_link_dead(uint8_t nb, const char* reason) {
+  if (nb < 1 || nb > NUM_NODES || nb == MY_NODE_ID) return;
+  bool was_alive = mesh.neighbors[nb].link_alive;
+  mesh.neighbors[nb].link_alive = false;
+  if (was_alive) {
+    Serial.printf("[ROUTE] *** Link N%d→N%d DEAD (%s) — failure detected ***\n",
+                  MY_NODE_ID, nb, reason);
+    routing_queue_route_update(MY_NODE_ID, nb, false);
+  }
+  routing_recompute_next_hop();
+}
+
+// Mark a neighbour alive after hearing it (HELLO or BEACON)
+void routing_note_neighbor_alive(uint8_t nid, int rssi) {
+  route_neighbor_t& nb = mesh.neighbors[nid];
+  bool was_dead = !nb.link_alive;
+  nb.link_alive = true;
+  nb.consec_ack_fails = 0;
+  nb.last_hello_ms = millis();
+  nb.wifi_rssi = (int8_t)rssi;
+  if (was_dead) {
+    Serial.printf("[ROUTE] Link N%d↔N%d UP (heard %s, RSSI=%d)\n",
+                  MY_NODE_ID, nid, nid == SINK_ID ? "sink" : "HELLO", rssi);
+    routing_queue_route_update(MY_NODE_ID, nid, true);
   }
 }
 
@@ -327,23 +528,27 @@ void routing_send_hello() {
   initPacket(pkt, MSG_HELLO, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, 0);
 
   hello_payload_t hp;
+  memset(&hp, 0, sizeof(hp));
   hp.node_id = MY_NODE_ID;
-  // Compute my hops_to_sink
-  if (MY_NODE_ID == 4) {
-    hp.hops_to_sink = 0;
-  } else if (mesh.next_hop_to_sink != 0) {
-    hp.hops_to_sink = mesh.neighbors[mesh.next_hop_to_sink].hops_to_sink + 1;
-  } else {
-    hp.hops_to_sink = 255;
-  }
-  hp.ack_success_rate = (mesh.next_hop_to_sink != 0)
-    ? mesh.neighbors[mesh.next_hop_to_sink].ack_success_rate : 0.0f;
-  hp.wifi_rssi = (mesh.next_hop_to_sink != 0)
-    ? mesh.neighbors[mesh.next_hop_to_sink].wifi_rssi : -100;
-  hp.node_retries = (uint16_t)mesh.mac_stats.total_retries;
+  hp.hops_to_sink = routing_my_hops();
+  hp.next_hop = mesh.next_hop_to_sink;
+  uint8_t nh = mesh.next_hop_to_sink;
+  hp.ack_success_rate = (nh != 0 && nh != MY_NODE_ID) ? mesh.neighbors[nh].ack_success_rate : 1.0f;
+  hp.wifi_rssi = (nh != 0 && nh != MY_NODE_ID) ? mesh.neighbors[nh].wifi_rssi : 0;
+  hp.node_retries = (uint16_t)min((uint32_t)65535, mesh.mac_stats.total_retries);
+  hp.cca_busy     = (uint16_t)min((uint32_t)65535, mesh.mac_stats.cca_busy_count);
+  hp.backoffs     = (uint16_t)min((uint32_t)65535, mesh.mac_stats.total_backoffs);
+  hp.ack_timeouts = (uint16_t)min((uint32_t)65535, mesh.mac_stats.total_acks_timeout);
+  hp.drops        = (uint16_t)min((uint32_t)65535, mesh.mac_stats.total_drops);
+  hp.synced = mesh.tdma.synced ? 1 : 0;
+  hp.synced_time_ms = tdma_synced_time();
+  uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
+  hp.duty_pct = total ? (uint8_t)(mesh.tdma.active_time_ms * 100ULL / total) : 100;
 
   setPayload(pkt, hp);
-  espnow_raw_send(BROADCAST_ID, pkt);  // Broadcast HELLOs without ACK
+  mac_send_broadcast(pkt, false);  // Broadcast: no ACK
+  mesh.last_hello_ms = millis();
+  mesh.hello_triggered = false;
 }
 
 // --- Process incoming HELLO ---
@@ -351,83 +556,135 @@ void mesh_handle_hello(const wsn_packet_t& pkt, int rssi) {
   hello_payload_t hp;
   getPayload(pkt, hp);
   uint8_t nid = hp.node_id;
-  if (nid < 1 || nid > NUM_NODES || nid == MY_NODE_ID) return;
-
-  // Skip if software-killed
+  if (nid < 1 || nid > NUM_NODES || nid == MY_NODE_ID || nid != pkt.src_id) return;
   if (mesh.killed_links[nid]) return;
 
+  routing_note_neighbor_alive(nid, rssi);
   route_neighbor_t& nb = mesh.neighbors[nid];
-  bool was_dead = !nb.link_alive;
-  nb.link_alive = true;
-  nb.consec_ack_fails = 0;  // Reset failure count upon hearing neighbor
-  nb.last_hello_ms = millis();
-  nb.wifi_rssi = rssi;
-  nb.hops_to_sink = hp.hops_to_sink;
+  nb.hops_to_sink = (nid == SINK_ID) ? 0 : hp.hops_to_sink;
+  nb.next_hop = hp.next_hop;
   nb.reported_retries = hp.node_retries;
-  // Don't overwrite local ACK stats — HELLO reports the *sender's* outbound stats
+  nb.reported_cca_busy = hp.cca_busy;
+  nb.reported_backoffs = hp.backoffs;
+  nb.reported_ack_timeouts = hp.ack_timeouts;
+  nb.reported_drops = hp.drops;
+  nb.reported_duty_pct = hp.duty_pct;
 
-  if (was_dead) {
-    Serial.printf("[ROUTE] Link N%d↔N%d RESTORED (HELLO received, RSSI=%d)\n",
-                  MY_NODE_ID, nid, rssi);
-    // Broadcast route update
-    wsn_packet_t rupkt;
-    initPacket(rupkt, MSG_ROUTE_UPDATE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, mesh.ctrl_seq_counter++);
-    route_update_payload_t ru = { MY_NODE_ID, nid, true };
-    setPayload(rupkt, ru);
-    espnow_raw_send(BROADCAST_ID, rupkt);
+  // Multi-hop time sync: if the sink's beacon is stale (e.g. our link to N4
+  // failed), adopt the clock of a synced neighbour that still has a route.
+  if (MY_NODE_ID != SINK_ID && hp.synced && hp.hops_to_sink != HOPS_INFINITY &&
+      (!mesh.tdma.synced || (millis() - mesh.tdma.last_beacon_rx_ms) > BEACON_STALE_MS)) {
+    bool was_synced = mesh.tdma.synced;
+    mesh.tdma.clock_offset = (int32_t)hp.synced_time_ms - (int32_t)millis();
+    mesh.tdma.synced = true;
+    mesh.tdma.synced_from_beacon = false;
+    mesh.tdma.last_sync_ms = millis();
+    if (!was_synced) {
+      Serial.printf("[TDMA] Synchronised via N%d HELLO (multi-hop time sync), offset=%ld ms\n",
+                    nid, (long)mesh.tdma.clock_offset);
+    }
   }
 
   routing_recompute_next_hop();
 }
 
-// --- Forward a packet toward its final destination ---
-bool routing_forward(wsn_packet_t pkt) {
-  // Decrement TTL
-  if (pkt.ttl == 0) {
-    Serial.printf("[ROUTE] Dropping packet seq=%d — TTL expired\n", pkt.seq_num);
+// --- Queue a transit packet for forwarding (called from RX callback) ---
+bool mesh_enqueue_forward(const wsn_packet_t& in) {
+  wsn_packet_t p = in;
+  if (p.ttl == 0) {
+    Serial.printf("[ROUTE] Dropping seq=%d (origin N%d) — TTL expired\n", p.seq_num, p.origin_id);
     return false;
   }
-  pkt.ttl--;
-  pkt.hop_count++;
-
-  // Record hop in route_path
-  if (pkt.hop_count < 4) {
-    pkt.route_path[pkt.hop_count] = MY_NODE_ID;
+  // Loop guard: drop if this node already appears in the recorded path
+  uint8_t last = (p.hop_count < 4) ? p.hop_count : 3;
+  for (uint8_t k = 0; k <= last; k++) {
+    if (p.route_path[k] == MY_NODE_ID) {
+      Serial.printf("[ROUTE] Dropping seq=%d (origin N%d) — routing loop detected\n", p.seq_num, p.origin_id);
+      return false;
+    }
   }
+  p.ttl--;
+  p.hop_count++;
+  if (p.hop_count < 4) p.route_path[p.hop_count] = MY_NODE_ID;
 
-  // Determine next hop
-  uint8_t next = mesh.next_hop_to_sink;
-  if (next == 0) {
-    Serial.printf("[ROUTE] Cannot forward seq=%d — no route to sink\n", pkt.seq_num);
-    return false;
+  bool ok = false;
+  uint8_t depth = 0;
+  portENTER_CRITICAL(&mesh_mux);
+  if (mesh.fwd_queue.count < FWD_QUEUE_SIZE) {
+    mesh.fwd_queue.queue[mesh.fwd_queue.head].pkt = p;
+    mesh.fwd_queue.queue[mesh.fwd_queue.head].attempts = 0;
+    mesh.fwd_queue.head = (mesh.fwd_queue.head + 1) % FWD_QUEUE_SIZE;
+    mesh.fwd_queue.count++;
+    depth = mesh.fwd_queue.count;
+    ok = true;
   }
-
-  pkt.dst_id = next;
-  Serial.printf("[ROUTE] Forwarding seq=%d (origin=N%d) via N%d\n",
-                pkt.seq_num, pkt.origin_id, next);
-  mesh.pkts_forwarded++;
-  return mac_send(pkt);
+  portEXIT_CRITICAL(&mesh_mux);
+  if (ok) {
+    Serial.printf("[ROUTE] Queued %s seq=%d (origin N%d) for forwarding (queue=%d)\n",
+                  msgTypeStr(p.msg_type), p.seq_num, p.origin_id, depth);
+  } else {
+    Serial.println("[ROUTE] Fwd queue full — dropping packet");
+  }
+  return ok;
 }
 
-// --- Check neighbor timeouts ---
+// --- Forward queued packets (main loop; relay slot or CAP) ---
+void mesh_service_forward_queue() {
+  bool can_forward = (!mesh.tdma.synced) || tdma_is_my_relay_slot() || (tdma_current_epoch() == EPOCH_CAP);
+  if (!can_forward) return;
+  static uint32_t defer_key = 0xFFFFFFFF;
+  if (defer_key == mesh_tx_opportunity_key()) return;   // already deferred in this window
+
+  while (true) {
+    fwd_entry_t e;
+    bool have = false;
+    portENTER_CRITICAL(&mesh_mux);
+    if (mesh.fwd_queue.count > 0) {
+      e = mesh.fwd_queue.queue[mesh.fwd_queue.tail];
+      have = true;
+    }
+    portEXIT_CRITICAL(&mesh_mux);
+    if (!have) break;
+
+    uint8_t next = mesh.next_hop_to_sink;
+    mac_result_t r;
+    if (next == 0) {
+      Serial.printf("[ROUTE] Cannot forward seq=%d (origin N%d) — no route to sink\n", e.pkt.seq_num, e.pkt.origin_id);
+      r = MAC_NO_ROUTE;
+    } else if (next == e.pkt.src_id) {
+      Serial.printf("[ROUTE] Not returning seq=%d to previous hop N%d (loop avoided) — dropped\n", e.pkt.seq_num, next);
+      r = MAC_NO_ROUTE;
+    } else {
+      e.pkt.dst_id = next;
+      Serial.printf("[ROUTE] Forwarding %s seq=%d (origin=N%d) via N%d\n",
+                    msgTypeStr(e.pkt.msg_type), e.pkt.seq_num, e.pkt.origin_id, next);
+      r = mac_send(e.pkt, e.attempts, tdma_epoch_deadline());
+    }
+
+    portENTER_CRITICAL(&mesh_mux);
+    if (r == MAC_DEFERRED) {
+      mesh.fwd_queue.queue[mesh.fwd_queue.tail] = e;  // keep attempts for next window
+    } else {
+      mesh.fwd_queue.tail = (mesh.fwd_queue.tail + 1) % FWD_QUEUE_SIZE;
+      mesh.fwd_queue.count--;
+    }
+    portEXIT_CRITICAL(&mesh_mux);
+
+    if (r == MAC_OK) mesh.pkts_forwarded++;
+    if (r == MAC_DEFERRED) { defer_key = mesh_tx_opportunity_key(); break; }
+  }
+}
+
+// --- Check neighbour timeouts ---
 void routing_check_timeouts() {
   for (int i = 1; i <= NUM_NODES; i++) {
     if (i == MY_NODE_ID) continue;
     route_neighbor_t& nb = mesh.neighbors[i];
     if (nb.link_alive && nb.last_hello_ms > 0 &&
         millis() - nb.last_hello_ms > HELLO_TIMEOUT_MS) {
-      nb.link_alive = false;
-      Serial.printf("[ROUTE] Link N%d↔N%d DEAD (HELLO timeout: %lu ms)\n",
-                    MY_NODE_ID, i, millis() - nb.last_hello_ms);
-
-      // Broadcast route update
-      wsn_packet_t rupkt;
-      initPacket(rupkt, MSG_ROUTE_UPDATE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, mesh.ctrl_seq_counter++);
-      route_update_payload_t ru = { MY_NODE_ID, (uint8_t)i, false };
-      setPayload(rupkt, ru);
-      espnow_raw_send(BROADCAST_ID, rupkt);
-
-      routing_recompute_next_hop();
+      char reason[40];
+      snprintf(reason, sizeof(reason), "HELLO timeout %lu ms", (unsigned long)(millis() - nb.last_hello_ms));
+      routing_mark_link_dead(i, reason);
     }
   }
 }
@@ -436,9 +693,8 @@ void routing_check_timeouts() {
 void mesh_handle_route_update(const wsn_packet_t& pkt) {
   route_update_payload_t ru;
   getPayload(pkt, ru);
-  Serial.printf("[ROUTE] Route update: Link N%d↔N%d %s\n",
-                ru.node_a, ru.node_b, ru.link_up ? "UP" : "DOWN");
-  // Recompute our route (the topology changed)
+  Serial.printf("[ROUTE] Route update from N%d: Link N%d↔N%d %s\n",
+                pkt.src_id, ru.node_a, ru.node_b, ru.link_up ? "UP" : "DOWN");
   routing_recompute_next_hop();
 }
 
@@ -446,226 +702,295 @@ void mesh_handle_route_update(const wsn_packet_t& pkt) {
 //                         TDMA LAYER
 // =====================================================================
 
-// --- Initialize TDMA state ---
 void tdma_init() {
-  mesh.tdma.clock_offset = 0;
-  mesh.tdma.frame_number = 0;
-  mesh.tdma.synced = false;
-  mesh.tdma.last_beacon_rx_ms = 0;
+  memset(&mesh.tdma, 0, sizeof(mesh.tdma));
   mesh.tdma.my_tx_slot = 0xFF;
   mesh.tdma.my_relay_slot = 0xFF;
-  mesh.tdma.my_tx_slots_mask = 0;
-  mesh.tdma.my_relay_slots_mask = 0;
-  mesh.tdma.schedule_received = false;
-  mesh.tdma.active_time_ms = 0;
-  mesh.tdma.sleep_time_ms = 0;
   mesh.tdma.last_epoch_switch_ms = millis();
   mesh.tdma.last_epoch = EPOCH_SLEEP;
-}
-
-// --- Get synchronized time ---
-uint32_t tdma_synced_time() {
-  return millis() + mesh.tdma.clock_offset;
-}
-
-// --- Get current epoch within superframe ---
-tdma_epoch_t tdma_current_epoch() {
-  if (!mesh.tdma.synced) return EPOCH_CAP;  // Default to CAP if not synced
-  uint32_t t = tdma_synced_time() % SUPERFRAME_MS;
-  if (t < BEACON_START_MS + BEACON_DURATION_MS) return EPOCH_BEACON;
-  if (t < CAP_START_MS + CAP_DURATION_MS)       return EPOCH_CAP;
-  if (t < SLOT1_START_MS + SLOT1_DURATION_MS)   return EPOCH_SLOT1;
-  if (t < SLOT2_START_MS + SLOT2_DURATION_MS)   return EPOCH_SLOT2;
-  if (t < SLOT3_START_MS + SLOT3_DURATION_MS)   return EPOCH_SLOT3;
-  if (t < SLOT4_START_MS + SLOT4_DURATION_MS)   return EPOCH_SLOT4;
-  return EPOCH_SLEEP;
-}
-
-// --- Time remaining in current epoch (ms) ---
-uint32_t tdma_epoch_remaining_ms() {
-  if (!mesh.tdma.synced) return 999;
-  uint32_t t = tdma_synced_time() % SUPERFRAME_MS;
-  uint32_t epoch_end;
-  switch (tdma_current_epoch()) {
-    case EPOCH_BEACON: epoch_end = BEACON_START_MS + BEACON_DURATION_MS; break;
-    case EPOCH_CAP:    epoch_end = CAP_START_MS + CAP_DURATION_MS; break;
-    case EPOCH_SLOT1:  epoch_end = SLOT1_START_MS + SLOT1_DURATION_MS; break;
-    case EPOCH_SLOT2:  epoch_end = SLOT2_START_MS + SLOT2_DURATION_MS; break;
-    case EPOCH_SLOT3:  epoch_end = SLOT3_START_MS + SLOT3_DURATION_MS; break;
-    case EPOCH_SLOT4:  epoch_end = SLOT4_START_MS + SLOT4_DURATION_MS; break;
-    case EPOCH_SLEEP:  epoch_end = SUPERFRAME_MS; break;
-    default:           epoch_end = SUPERFRAME_MS; break;
-  }
-  return (epoch_end > t) ? (epoch_end - t) : 0;
-}
-
-// --- Is this my TX slot? (Transmitting own sensor data) ---
-bool tdma_is_my_tx_slot() {
-  if (!mesh.tdma.synced) return true;  // Unsynced: free running
-  tdma_epoch_t now = tdma_current_epoch();
-  return (mesh.tdma.my_tx_slots_mask & (1 << now)) != 0;
-}
-
-// --- Is this my RELAY slot? (Forwarding queued transit packets) ---
-bool tdma_is_my_relay_slot() {
-  if (!mesh.tdma.synced) return true;  // Unsynced: free running
-  tdma_epoch_t now = tdma_current_epoch();
-  return (mesh.tdma.my_relay_slots_mask & (1 << now)) != 0;
-}
-
-// --- Is this the sleep epoch? ---
-bool tdma_is_sleep_epoch() {
-  return tdma_current_epoch() == EPOCH_SLEEP;
+  mesh.tdma.last_epoch_active = true;
 }
 
 // --- Process incoming beacon from N4 ---
-void mesh_handle_beacon(const wsn_packet_t& pkt) {
-  if (pkt.origin_id != 4) return;  // Only accept beacons from the sink
+void mesh_handle_beacon(const wsn_packet_t& pkt, int rssi) {
+  if (pkt.origin_id != SINK_ID || pkt.src_id != SINK_ID) return;
   beacon_payload_t bp;
   getPayload(pkt, bp);
 
-  // Sync clock
-  mesh.tdma.clock_offset = (int32_t)bp.timestamp_ms - (int32_t)millis();
+  bool first = !mesh.tdma.synced || !mesh.tdma.synced_from_beacon;
+  int32_t new_offset = (int32_t)bp.timestamp_ms - (int32_t)millis();
+  int32_t correction = new_offset - mesh.tdma.clock_offset;
+  mesh.tdma.clock_offset = new_offset;
   mesh.tdma.frame_number = bp.frame_number;
   mesh.tdma.synced = true;
+  mesh.tdma.synced_from_beacon = true;
   mesh.tdma.last_beacon_rx_ms = millis();
+  mesh.tdma.last_sync_ms = millis();
 
-  // Sink is directly heard! Mark N4 alive and 0 hops
-  mesh.neighbors[4].link_alive = true;
-  mesh.neighbors[4].consec_ack_fails = 0;  // Reset failure count upon hearing sink
-  mesh.neighbors[4].last_hello_ms = millis();
-  mesh.neighbors[4].hops_to_sink = 0;
+  // Sink heard directly: N4 is a 0-hop neighbour
+  routing_note_neighbor_alive(SINK_ID, rssi);
+  mesh.neighbors[SINK_ID].hops_to_sink = 0;
+  mesh.neighbors[SINK_ID].next_hop = SINK_ID;
   routing_recompute_next_hop();
 
-  uint8_t ch = 0;
-  wifi_second_chan_t sec;
-  esp_wifi_get_channel(&ch, &sec);
-  Serial.printf("[TDMA] Beacon sync: frame=%lu offset=%ld ms | Channel %d LOCKED\n",
-                bp.frame_number, mesh.tdma.clock_offset, ch);
+  if (first) {
+    uint8_t ch = 0;
+    wifi_second_chan_t sec;
+    esp_wifi_get_channel(&ch, &sec);
+    Serial.printf("[TDMA] Beacon sync: frame=%lu offset=%ld ms | Channel %d LOCKED\n",
+                  (unsigned long)bp.frame_number, (long)mesh.tdma.clock_offset, ch);
+  } else if (bp.frame_number % 25 == 0) {
+    Serial.printf("[TDMA] Beacon frame=%lu (clock correction %+ld ms)\n",
+                  (unsigned long)bp.frame_number, (long)correction);
+  }
 }
 
-// --- N4: Broadcast a time-sync beacon ---
+// --- N4: Broadcast a time-sync beacon (called in the BEACON epoch) ---
 void tdma_send_beacon() {
-  if (MY_NODE_ID != 4) return;  // Only the sink sends beacons
-
-  static uint32_t frame_counter = 0;
+  if (MY_NODE_ID != SINK_ID) return;
   wsn_packet_t pkt;
-  initPacket(pkt, MSG_BEACON, BROADCAST_ID, 4, BROADCAST_ID, 0);
+  initPacket(pkt, MSG_BEACON, BROADCAST_ID, SINK_ID, BROADCAST_ID, 0);
   beacon_payload_t bp;
-  bp.frame_number = frame_counter++;
-  bp.timestamp_ms = millis();
+  bp.frame_number = tdma_current_frame();
+  bp.timestamp_ms = millis();  // N4 is the time reference (offset 0)
   setPayload(pkt, bp);
-  espnow_raw_send(BROADCAST_ID, pkt);
+  mac_send_broadcast(pkt, false);
   mesh.tdma.frame_number = bp.frame_number;
 }
 
-// --- Process incoming TDMA schedule from N3 (Multi-slot bitmask support) ---
-void mesh_handle_schedule(const wsn_packet_t& pkt) {
-  schedule_payload_t sp;
-  getPayload(pkt, sp);
+// --- Human-readable slot table ---
+void tdma_schedule_to_string(const schedule_payload_t& sp, char* out, size_t n) {
+  out[0] = '\0';
+  for (uint8_t e = EPOCH_SLOT1; e <= EPOCH_SLOT4; e++) {
+    char part[20] = "";
+    bool found = false;
+    for (int i = 0; i < sp.slot_count && i < 8; i++) {
+      if (sp.slots[i].slot_index != e) continue;
+      found = true;
+      if (sp.slots[i].node_id == 0 || sp.slots[i].slot_type == SLOT_SLEEP) {
+        snprintf(part, sizeof(part), "%s=UNUSED ", epochStr(e));
+      } else {
+        snprintf(part, sizeof(part), "%s=N%d:%s ", epochStr(e), sp.slots[i].node_id,
+                 sp.slots[i].slot_type == SLOT_RELAY ? "RELAY" : "TX");
+      }
+      break;
+    }
+    if (!found) snprintf(part, sizeof(part), "%s=UNUSED ", epochStr(e));
+    strncat(out, part, n - strlen(out) - 1);
+  }
+}
+
+// --- Apply a schedule (received, or local from the coordinator) ---
+void tdma_apply_schedule(const schedule_payload_t& sp, bool local) {
+  uint32_t now = millis();
+  if (sp.issuer == CLUSTER_HEAD_ID) mesh.tdma.last_primary_sched_ms = now;
+
+  // Conflict resolution: N3 (primary) wins; N4 failover schedules are only
+  // accepted when no N3 schedule has been heard recently.
+  if (!local && sp.issuer == SINK_ID) {
+    if (MY_NODE_ID == CLUSTER_HEAD_ID) {
+      mesh.sched_announce_pending = true;  // re-assert primary schedule
+      return;
+    }
+    if (mesh.tdma.last_primary_sched_ms != 0 &&
+        now - mesh.tdma.last_primary_sched_ms < SCHED_PRIMARY_TIMEOUT_MS) {
+      return;
+    }
+  }
+  mesh.tdma.last_sched_rx_ms = now;
+
+  bool changed = !mesh.tdma.schedule_received || sp.version != mesh.tdma.sched_version ||
+                 sp.issuer != mesh.tdma.sched_issuer;
+  if (!changed) return;  // periodic refresh of the same schedule
 
   mesh.tdma.my_tx_slot = 0xFF;
   mesh.tdma.my_relay_slot = 0xFF;
   mesh.tdma.my_tx_slots_mask = 0;
   mesh.tdma.my_relay_slots_mask = 0;
+  memset(mesh.tdma.slot_owner, 0, sizeof(mesh.tdma.slot_owner));
   mesh.tdma.schedule_received = true;
-
-  Serial.printf("[TDMA] Schedule received (%d slots): %s\n", sp.slot_count, sp.update_reason);
+  mesh.tdma.sched_version = sp.version;
+  mesh.tdma.sched_issuer = sp.issuer;
+  strncpy(mesh.tdma.sched_reason, sp.update_reason, sizeof(mesh.tdma.sched_reason) - 1);
+  mesh.tdma.sched_reason[sizeof(mesh.tdma.sched_reason) - 1] = '\0';
 
   for (int i = 0; i < sp.slot_count && i < 8; i++) {
-    if (sp.slots[i].node_id == MY_NODE_ID) {
-      if (sp.slots[i].slot_type == SLOT_TX) {
-        mesh.tdma.my_tx_slots_mask |= (1 << sp.slots[i].slot_index);
-        mesh.tdma.my_tx_slot = sp.slots[i].slot_index;
-        Serial.printf("[TDMA]   My TX slot: EPOCH_%d\n", sp.slots[i].slot_index);
-      } else if (sp.slots[i].slot_type == SLOT_RELAY) {
-        mesh.tdma.my_relay_slots_mask |= (1 << sp.slots[i].slot_index);
-        mesh.tdma.my_relay_slot = sp.slots[i].slot_index;
-        Serial.printf("[TDMA]   My RELAY slot: EPOCH_%d\n", sp.slots[i].slot_index);
+    uint8_t idx = sp.slots[i].slot_index;
+    if (idx < EPOCH_SLOT1 || idx > EPOCH_SLOT4) continue;
+    if (sp.slots[i].slot_type == SLOT_SLEEP || sp.slots[i].node_id == 0) continue;
+    mesh.tdma.slot_owner[idx] = sp.slots[i].node_id;
+    if (sp.slots[i].node_id != MY_NODE_ID) continue;
+    if (sp.slots[i].slot_type == SLOT_TX) {
+      mesh.tdma.my_tx_slots_mask |= (1 << idx);
+      mesh.tdma.my_tx_slot = idx;
+    } else if (sp.slots[i].slot_type == SLOT_RELAY) {
+      mesh.tdma.my_relay_slots_mask |= (1 << idx);
+      mesh.tdma.my_relay_slot = idx;
+    }
+  }
+
+  char table[96];
+  tdma_schedule_to_string(sp, table, sizeof(table));
+  Serial.printf("[TDMA] Schedule v%u from N%d applied (%s): %s\n",
+                sp.version, sp.issuer, sp.update_reason, table);
+  char mine[48] = "";
+  for (uint8_t e = EPOCH_SLOT1; e <= EPOCH_SLOT4; e++) {
+    char part[16];
+    if (mesh.tdma.my_tx_slots_mask & (1 << e)) { snprintf(part, sizeof(part), "%s:TX ", epochStr(e)); strncat(mine, part, sizeof(mine) - strlen(mine) - 1); }
+    if (mesh.tdma.my_relay_slots_mask & (1 << e)) { snprintf(part, sizeof(part), "%s:RELAY ", epochStr(e)); strncat(mine, part, sizeof(mine) - strlen(mine) - 1); }
+  }
+  if (mine[0]) {
+    Serial.printf("[TDMA]   My slots: %s\n", mine);
+  } else if (MY_NODE_ID != SINK_ID) {
+    Serial.println("[TDMA]   No slot assigned to me → own data uses the CAP (contention)");
+  }
+}
+
+void mesh_handle_schedule(const wsn_packet_t& pkt) {
+  schedule_payload_t sp;
+  getPayload(pkt, sp);
+  if (sp.issuer != pkt.origin_id) return;
+  tdma_apply_schedule(sp, false);
+}
+
+// --- Coordinator: build a schedule from network state ---
+// Slot plan: S1=N1 TX, S2=N2 TX, S3=N3 TX (aggregate), S4=N2 RELAY.
+// Dynamic changes: absent node → its slot is released (UNUSED);
+// N1 vibration alert → S4 given to N1 as an extra TX slot.
+void tdma_build_schedule(schedule_payload_t& sp, bool n1, bool n2, bool n3, bool n1_alert,
+                         const char* reason, uint16_t version, uint8_t issuer) {
+  memset(&sp, 0, sizeof(sp));
+  sp.version = version;
+  sp.issuer = issuer;
+  sp.slot_count = 4;
+  sp.slots[0] = { (uint8_t)(n1 ? 1 : 0), EPOCH_SLOT1, (uint8_t)(n1 ? SLOT_TX : SLOT_SLEEP) };
+  sp.slots[1] = { (uint8_t)(n2 ? 2 : 0), EPOCH_SLOT2, (uint8_t)(n2 ? SLOT_TX : SLOT_SLEEP) };
+  sp.slots[2] = { (uint8_t)(n3 ? 3 : 0), EPOCH_SLOT3, (uint8_t)(n3 ? SLOT_TX : SLOT_SLEEP) };
+  if (n1 && n1_alert)  sp.slots[3] = { 1, EPOCH_SLOT4, SLOT_TX };
+  else if (n2)         sp.slots[3] = { 2, EPOCH_SLOT4, SLOT_RELAY };
+  else                 sp.slots[3] = { 0, EPOCH_SLOT4, SLOT_SLEEP };
+  strncpy(sp.update_reason, reason, sizeof(sp.update_reason) - 1);
+}
+
+// --- Coordinator: adopt and announce a new schedule ---
+void tdma_publish_schedule(const schedule_payload_t& sp) {
+  mesh.sched_current = sp;
+  mesh.sched_is_coordinator = true;
+  mesh.sched_announce_pending = true;
+  tdma_apply_schedule(sp, true);
+}
+
+void tdma_announce_schedule(bool changed) {
+  wsn_packet_t pkt;
+  initPacket(pkt, MSG_SCHEDULE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, 0);
+  setPayload(pkt, mesh.sched_current);
+  mac_send_broadcast(pkt, false);
+  mesh.last_sched_announce_ms = millis();
+  if (changed) {
+    Serial.printf("[TDMA] Broadcast schedule v%u (%s)\n", mesh.sched_current.version, mesh.sched_current.update_reason);
+  }
+}
+
+// --- Does this node have a TX/RX role in an epoch? (duty-cycle accounting) ---
+bool tdma_epoch_is_active(tdma_epoch_t e) {
+  if (!mesh.tdma.synced) return true;
+  if (e == EPOCH_BEACON || e == EPOCH_CAP) return true;
+  if (e == EPOCH_SLEEP) return false;
+  uint8_t bit = (1 << e);
+  if ((mesh.tdma.my_tx_slots_mask | mesh.tdma.my_relay_slots_mask) & bit) return true;
+  uint8_t owner = mesh.tdma.slot_owner[e];
+  if (owner == 0 || owner == MY_NODE_ID) return false;              // unused slot
+  if (mesh.neighbors[owner].next_hop == MY_NODE_ID) return true;   // I receive from the slot owner
+  return false;
+}
+
+// --- Note an own TX slot that carried no packet ---
+void mesh_note_unused_slot(const char* why) {
+  mesh.tdma.unused_slots++;
+  if (mesh.tdma.unused_slots % 10 == 1) {
+    Serial.printf("[TDMA] %s unused (%s) → radio idle [unused own slots=%lu]\n",
+                  epochStr(tdma_current_epoch()), why, (unsigned long)mesh.tdma.unused_slots);
+  }
+}
+
+// --- Epoch bookkeeping: duty cycle, frame summary, optional light sleep ---
+void tdma_tick() {
+  uint32_t now = millis();
+  tdma_epoch_t epoch = tdma_current_epoch();
+  if (epoch == mesh.tdma.last_epoch) return;
+
+  uint32_t dt = now - mesh.tdma.last_epoch_switch_ms;
+  if (mesh.tdma.last_epoch_active) mesh.tdma.active_time_ms += dt;
+  else                             mesh.tdma.sleep_time_ms += dt;
+  mesh.tdma.last_epoch = epoch;
+  mesh.tdma.last_epoch_switch_ms = now;
+  mesh.tdma.last_epoch_active = tdma_epoch_is_active(epoch);
+
+  if (!mesh.tdma.synced) return;
+  uint32_t frame = tdma_current_frame();
+  mesh.tdma.frame_number = frame;
+
+  if (epoch == EPOCH_BEACON && frame - mesh.tdma.last_logged_frame >= TDMA_LOG_EVERY_FRAMES) {
+    mesh.tdma.last_logged_frame = frame;
+    char idle[40] = "";
+    for (uint8_t e = EPOCH_SLOT1; e <= EPOCH_SLEEP; e++) {
+      if (!tdma_epoch_is_active((tdma_epoch_t)e)) {
+        strncat(idle, epochStr(e), sizeof(idle) - strlen(idle) - 1);
+        strncat(idle, " ", sizeof(idle) - strlen(idle) - 1);
+      }
+    }
+    uint32_t total = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
+    float duty = total ? (mesh.tdma.active_time_ms * 100.0f / total) : 100.0f;
+    Serial.printf("[TDMA] Frame %lu | sched v%u | radio idle/sleep in: %s| duty=%.1f%% (active=%lu ms, sleep=%lu ms)\n",
+                  (unsigned long)frame, mesh.tdma.sched_version, idle, duty,
+                  (unsigned long)mesh.tdma.active_time_ms, (unsigned long)mesh.tdma.sleep_time_ms);
+  }
+
+  if (epoch == EPOCH_SLEEP && frame % TDMA_LOG_EVERY_FRAMES == 0) {
+    Serial.printf("[TDMA] SLEEP epoch: no Wi-Fi TX for %d ms (wake at next BEACON)\n", SLEEP_DURATION_MS);
+  }
+
+#if WSN_ENABLE_LIGHT_SLEEP
+  // Optional real light sleep for the leaf sensor in the SLEEP epoch.
+  // UNVERIFIED on hardware: BLE controller / ESP-NOW behaviour must be checked.
+  if (epoch == EPOCH_SLEEP && MY_NODE_ID == 1 && (now - mesh.last_ble_scan_ms) > BLE_SCAN_DURATION_MS + 20) {
+    uint32_t rem = tdma_epoch_remaining_ms();
+    if (rem > 20) {
+      esp_sleep_enable_timer_wakeup((uint64_t)(rem - 10) * 1000ULL);
+      esp_err_t err = esp_light_sleep_start();
+      if (err != ESP_OK && frame % TDMA_LOG_EVERY_FRAMES == 0) {
+        Serial.printf("[TDMA] Light sleep rejected: %s\n", esp_err_to_name(err));
       }
     }
   }
-}
-
-// --- N3: Build and broadcast a default TDMA schedule ---
-void tdma_send_default_schedule(const char* reason) {
-  wsn_packet_t pkt;
-  initPacket(pkt, MSG_SCHEDULE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, 0);
-
-  schedule_payload_t sp;
-  memset(&sp, 0, sizeof(sp));
-  sp.slot_count = 4;
-
-  // Default assignments
-  sp.slots[0] = { 1, EPOCH_SLOT1, SLOT_TX };   // N1 transmits in Slot 1
-  sp.slots[1] = { 2, EPOCH_SLOT2, SLOT_TX };   // N2 transmits in Slot 2
-  sp.slots[2] = { 3, EPOCH_SLOT3, SLOT_TX };   // N3 (aggregated) in Slot 3
-  sp.slots[3] = { 2, EPOCH_SLOT4, SLOT_RELAY }; // N2 relay in Slot 4 (standby)
-
-  strncpy(sp.update_reason, reason, sizeof(sp.update_reason) - 1);
-  setPayload(pkt, sp);
-
-  espnow_raw_send(BROADCAST_ID, pkt);
-
-  // Also apply locally
-  mesh_handle_schedule(pkt);
-}
-
-// --- N3: Dynamic schedule update ---
-void tdma_update_schedule_if_needed(bool n1_alert, bool n2_idle, bool n3_offline) {
-  if (MY_NODE_ID != 3 && MY_NODE_ID != 4) return;
-
-  wsn_packet_t pkt;
-  initPacket(pkt, MSG_SCHEDULE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, 0);
-
-  schedule_payload_t sp;
-  memset(&sp, 0, sizeof(sp));
-
-  if (n3_offline && MY_NODE_ID == 4) {
-    // N4 takes over scheduling when N3 is offline
-    sp.slot_count = 3;
-    sp.slots[0] = { 1, EPOCH_SLOT1, SLOT_TX };
-    sp.slots[1] = { 2, EPOCH_SLOT2, SLOT_TX };
-    sp.slots[2] = { 2, EPOCH_SLOT4, SLOT_RELAY };
-    strncpy(sp.update_reason, "FAILOVER: N3 offline", sizeof(sp.update_reason) - 1);
-  } else if (n1_alert) {
-    // N1 alert: give it extra slot
-    sp.slot_count = 5;
-    sp.slots[0] = { 1, EPOCH_SLOT1, SLOT_TX };
-    sp.slots[1] = { 2, EPOCH_SLOT2, SLOT_TX };
-    sp.slots[2] = { 3, EPOCH_SLOT3, SLOT_TX };
-    sp.slots[3] = { 1, EPOCH_SLOT4, SLOT_TX };  // Extra slot for N1
-    sp.slots[4] = { 2, EPOCH_SLOT4, SLOT_SLEEP }; // N2 relay deferred
-    strncpy(sp.update_reason, "ALERT: N1 anomaly", sizeof(sp.update_reason) - 1);
-  } else if (n2_idle) {
-    // N2 idle: release its slot
-    sp.slot_count = 3;
-    sp.slots[0] = { 1, EPOCH_SLOT1, SLOT_TX };
-    sp.slots[1] = { 2, EPOCH_SLOT2, SLOT_SLEEP };
-    sp.slots[2] = { 3, EPOCH_SLOT3, SLOT_TX };
-    strncpy(sp.update_reason, "IDLE: N2 no data", sizeof(sp.update_reason) - 1);
-  } else {
-    // Revert back to default schedule when alerts clear! (Defect 4 fix)
-    tdma_send_default_schedule("REVERT: normal schedule");
-    return;
-  }
-
-  setPayload(pkt, sp);
-  espnow_raw_send(BROADCAST_ID, pkt);
-  mesh_handle_schedule(pkt);
-  Serial.printf("[TDMA] Schedule updated: %s\n", sp.update_reason);
+#endif
 }
 
 // =====================================================================
 //                    ESP-NOW CALLBACKS (DISPATCH)
 // =====================================================================
 
-// Promiscuous sniffer callback for software CCA
+// Promiscuous sniffer callback for software CCA. Only ESP-NOW frames
+// (vendor-specific action frames) from known WSN peers count as "busy";
+// foreign Wi-Fi traffic is arbitrated by the hardware 802.11 DCF.
 void promisc_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-  mesh.last_rx_time_ms = millis();
+  if (type != WIFI_PKT_MGMT || buf == nullptr) return;
+  const wifi_promiscuous_pkt_t* p = (const wifi_promiscuous_pkt_t*)buf;
+  if (p->rx_ctrl.sig_len < 25) return;
+  const uint8_t* f = p->payload;
+  uint8_t subtype = (f[0] >> 4) & 0x0F;
+  if (subtype != 0x0D || f[24] != 127) return;   // action frame, vendor-specific category
+  const uint8_t* sa = f + 10;                     // addr2 = transmitter
+  for (int i = 1; i <= NUM_NODES; i++) {
+    if (i == MY_NODE_ID) continue;
+    if (memcmp(sa, mesh.peer_macs[i], 6) == 0 || memcmp(sa, NODE_MAC[i], 6) == 0) {
+      mesh.last_rx_time_ms = millis();
+      return;
+    }
+  }
 }
 
-// --- OnDataRecv: master dispatcher ---
+// --- OnDataRecv: validation + master dispatcher ---
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 void mesh_on_recv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   const uint8_t* src_mac = (info) ? info->src_addr : nullptr;
@@ -675,90 +1000,78 @@ void mesh_on_recv(const uint8_t* mac_addr, const uint8_t* data, int len) {
   const uint8_t* src_mac = mac_addr;
   int rssi = -50;
 #endif
-  if (len < (int)sizeof(wsn_packet_t)) return;
+  if (len < WSN_HEADER_LEN || len > (int)sizeof(wsn_packet_t)) return;
 
   wsn_packet_t pkt;
-  memcpy(&pkt, data, sizeof(wsn_packet_t));
+  memset(&pkt, 0, sizeof(pkt));
+  memcpy(&pkt, data, len);
 
-  // Ignore foreign packets from outside our 4-node network
-  if (pkt.src_id < 1 || pkt.src_id > NUM_NODES) return;
+  // Ignore foreign ESP-NOW traffic
+  if (pkt.magic != WSN_MAGIC) return;
+  if (pkt.src_id < 1 || pkt.src_id > NUM_NODES || pkt.src_id == MY_NODE_ID) return;
+
+  // Structural validation
+  int min_len = wsn_min_payload_len(pkt.msg_type);
+  if (min_len < 0 || pkt.payload_len != len - WSN_HEADER_LEN || pkt.payload_len < min_len ||
+      pkt.origin_id < 1 || pkt.origin_id > NUM_NODES ||
+      (pkt.dst_id != BROADCAST_ID && (pkt.dst_id < 1 || pkt.dst_id > NUM_NODES))) {
+    mesh.mac_stats.malformed_rx++;
+    if (mesh.mac_stats.malformed_rx % 10 == 1) {
+      Serial.printf("[MESH] Malformed frame type=0x%02X from N%d (len=%d payload_len=%d) — dropped\n",
+                    pkt.msg_type, pkt.src_id, len, pkt.payload_len);
+    }
+    return;
+  }
 
   // Dynamic peer MAC auto-learning
-  if (src_mac && pkt.src_id >= 1 && pkt.src_id <= NUM_NODES) {
-    if (memcmp(mesh.peer_macs[pkt.src_id], src_mac, 6) != 0) {
-      memcpy(mesh.peer_macs[pkt.src_id], src_mac, 6);
-      if (!esp_now_is_peer_exist(src_mac)) {
-        esp_now_peer_info_t peer = {};
-        memcpy(peer.peer_addr, src_mac, 6);
-        peer.channel = 0;
-        peer.encrypt = false;
-        esp_now_add_peer(&peer);
-      }
-      Serial.printf("[MESH] Auto-learned MAC for N%d: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                    pkt.src_id, src_mac[0], src_mac[1], src_mac[2],
-                    src_mac[3], src_mac[4], src_mac[5]);
+  if (src_mac && memcmp(mesh.peer_macs[pkt.src_id], src_mac, 6) != 0) {
+    memcpy(mesh.peer_macs[pkt.src_id], src_mac, 6);
+    if (!esp_now_is_peer_exist(src_mac)) {
+      esp_now_peer_info_t peer = {};
+      memcpy(peer.peer_addr, src_mac, 6);
+      peer.channel = 0;
+      peer.encrypt = false;
+      esp_now_add_peer(&peer);
     }
+    Serial.printf("[MESH] Auto-learned MAC for N%d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  pkt.src_id, src_mac[0], src_mac[1], src_mac[2],
+                  src_mac[3], src_mac[4], src_mac[5]);
   }
 
-  // Update CCA timestamp
   mesh.last_rx_time_ms = millis();
 
-  // Software link kill check
-  if (pkt.src_id >= 1 && pkt.src_id <= NUM_NODES && mesh.killed_links[pkt.src_id]) {
-    return;  // Silently drop
+  // Control commands are management traffic: processed even on a
+  // software-killed link, otherwise RESTORE could never reach that node.
+  if (pkt.msg_type == MSG_CTRL) {
+    mesh_handle_ctrl(pkt);
+    return;
   }
 
-  // Dispatch by message type
+  // Software link kill (failure INJECTION): silently drop
+  if (mesh.killed_links[pkt.src_id]) return;
+  mesh.last_heard_ms[pkt.src_id] = millis();
+
   switch (pkt.msg_type) {
-    case MSG_ACK:
-      mesh_handle_ack(pkt);
-      break;
-
-    case MSG_HELLO:
-      mesh_handle_hello(pkt, rssi);
-      break;
-
-    case MSG_BEACON:
-      mesh_handle_beacon(pkt);
-      break;
-
-    case MSG_SCHEDULE:
-      mesh_handle_schedule(pkt);
-      break;
-
-    case MSG_DATA:
-      mesh_handle_data(pkt, rssi);
-      break;
-
-    case MSG_AGG:
-      mesh_handle_agg(pkt, rssi);
-      break;
-
-    case MSG_ROUTE_UPDATE:
-      mesh_handle_route_update(pkt);
-      break;
-
-    case MSG_BLE_REPORT:
-      mesh_handle_ble_report(pkt);
-      break;
-
-    case MSG_CTRL:
-      mesh_handle_ctrl(pkt);
-      break;
-
-    default:
-      Serial.printf("[MESH] Unknown msg_type=0x%02X from N%d\n", pkt.msg_type, pkt.src_id);
-      break;
+    case MSG_ACK:          mesh_handle_ack(pkt); break;
+    case MSG_HELLO:        mesh_handle_hello(pkt, rssi); break;
+    case MSG_BEACON:       mesh_handle_beacon(pkt, rssi); break;
+    case MSG_SCHEDULE:     mesh_handle_schedule(pkt); break;
+    case MSG_DATA:         mesh_handle_data(pkt, rssi); break;
+    case MSG_AGG:          mesh_handle_agg(pkt, rssi); break;
+    case MSG_ROUTE_UPDATE: mesh_handle_route_update(pkt); break;
+    case MSG_BLE_REPORT:   mesh_handle_ble_report(pkt, rssi); break;
+    default: break;
   }
 }
 
 // --- OnDataSent callback ---
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+// ESP-IDF 5.5 (Arduino-ESP32 3.3.x) changed the send-callback signature.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 void mesh_on_sent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
 #else
 void mesh_on_sent(const uint8_t* mac, esp_now_send_status_t status) {
 #endif
-  // Primarily used for debugging; real reliability is via app-level ACK
+  // Link-layer (802.11) delivery status; end-to-end hop reliability uses the app ACK.
   if (status != ESP_NOW_SEND_SUCCESS) {
     Serial.println("[ESP-NOW] Link-layer send failed");
   }
@@ -768,80 +1081,66 @@ void mesh_on_sent(const uint8_t* mac, esp_now_send_status_t status) {
 //                    MESSAGE HANDLERS
 // =====================================================================
 
-// --- Handle incoming ACK ---
 void mesh_handle_ack(const wsn_packet_t& pkt) {
   if (pkt.dst_id != MY_NODE_ID) return;
   ack_payload_t ap;
   getPayload(pkt, ap);
   if (mesh.ack_pending &&
+      pkt.src_id == mesh.ack_expected_from &&
       ap.acked_seq_num == mesh.ack_expected_seq &&
-      ap.acked_origin_id == mesh.ack_expected_origin) {
+      ap.acked_origin_id == mesh.ack_expected_origin &&
+      ap.acked_type == mesh.ack_expected_type) {
     mesh.ack_received = true;
   }
 }
 
-// --- Handle incoming DATA ---
+// Common unicast receive path: ACK, duplicate check, log
+bool mesh_accept_unicast(const wsn_packet_t& pkt) {
+  if (pkt.dst_id != MY_NODE_ID) return false;   // not addressed to us: no ACK, no processing
+  mac_send_ack(pkt);
+  if (mesh_seen_before(pkt.msg_type, pkt.origin_id, pkt.seq_num)) {
+    mesh.mac_stats.dup_rx++;
+    mesh.dup_rx_by_origin[pkt.origin_id]++;
+    Serial.printf("[MAC] Duplicate %s seq=%d origin=N%d from N%d (re-ACKed, not re-processed)\n",
+                  msgTypeStr(pkt.msg_type), pkt.seq_num, pkt.origin_id, pkt.src_id);
+    return false;
+  }
+  logPacket("RX", pkt);
+  return true;
+}
+
 void mesh_handle_data(const wsn_packet_t& pkt, int rssi) {
-  // Send ACK if unicast to us
-  if (pkt.dst_id == MY_NODE_ID) {
-    mac_send_ack(pkt);
-    logPacket("RX", pkt);
-
-    if (pkt.final_dst_id == MY_NODE_ID) {
-      // This packet is for ME — deliver to application
-      mesh.pkts_received_at_sink++;
-      app_on_data_for_me(pkt, rssi);
-    } else {
-      // Intermediate hop: check if application consumes it (e.g., N3 aggregation)
-      if (!app_on_data_transit(pkt, rssi)) {
-        // App didn't consume it — queue for forwarding outside callback context (Defect 1 fix)
-        if (mesh.fwd_queue.count < FWD_QUEUE_SIZE) {
-          mesh.fwd_queue.queue[mesh.fwd_queue.head] = pkt;
-          mesh.fwd_queue.head = (mesh.fwd_queue.head + 1) % FWD_QUEUE_SIZE;
-          mesh.fwd_queue.count++;
-        } else {
-          Serial.println("[ROUTE] Fwd queue full — dropping packet");
-        }
-      }
-    }
+  if (!mesh_accept_unicast(pkt)) return;
+  if (pkt.final_dst_id == MY_NODE_ID) {
+    mesh.pkts_received_at_sink++;
+    app_on_data_for_me(pkt, rssi);
+  } else if (!app_on_data_transit(pkt, rssi)) {
+    mesh_enqueue_forward(pkt);
   }
-  // Ignore if not addressed to us (don't ACK, don't process)
 }
 
-// --- Handle incoming AGG (same logic as DATA) ---
 void mesh_handle_agg(const wsn_packet_t& pkt, int rssi) {
-  if (pkt.dst_id == MY_NODE_ID) {
-    mac_send_ack(pkt);
-    logPacket("RX", pkt);
-
-    if (pkt.final_dst_id == MY_NODE_ID) {
-      mesh.pkts_received_at_sink++;
-      app_on_data_for_me(pkt, rssi);
-    } else {
-      // Non-blocking forwarding queue (Defect 1 fix)
-      if (mesh.fwd_queue.count < FWD_QUEUE_SIZE) {
-        mesh.fwd_queue.queue[mesh.fwd_queue.head] = pkt;
-        mesh.fwd_queue.head = (mesh.fwd_queue.head + 1) % FWD_QUEUE_SIZE;
-        mesh.fwd_queue.count++;
-      } else {
-        Serial.println("[ROUTE] Fwd queue full — dropping packet");
-      }
-    }
+  if (!mesh_accept_unicast(pkt)) return;
+  if (pkt.final_dst_id == MY_NODE_ID) {
+    mesh.pkts_received_at_sink++;
+    app_on_data_for_me(pkt, rssi);
+  } else {
+    mesh_enqueue_forward(pkt);
   }
 }
 
-// --- Handle BLE report ---
-void mesh_handle_ble_report(const wsn_packet_t& pkt) {
-  if (pkt.dst_id == MY_NODE_ID) {
-    mac_send_ack(pkt);
-    logPacket("RX", pkt);
-    // Application handles it (N4 processes, others ignore)
-    app_on_data_for_me(pkt, 0);
+// BLE reports travel multi-hop to the sink like data (forwarded, not consumed)
+void mesh_handle_ble_report(const wsn_packet_t& pkt, int rssi) {
+  if (!mesh_accept_unicast(pkt)) return;
+  if (pkt.final_dst_id == MY_NODE_ID) {
+    app_on_data_for_me(pkt, rssi);
+  } else {
+    mesh_enqueue_forward(pkt);
   }
 }
 
-// --- Handle CTRL command ---
 void mesh_handle_ctrl(const wsn_packet_t& pkt) {
+  if (mesh_seen_before(MSG_CTRL, pkt.origin_id, pkt.seq_num)) return;  // N4 repeats CTRL 3x
   ctrl_payload_t cp;
   getPayload(pkt, cp);
   logPacket("RX", pkt);
@@ -849,24 +1148,25 @@ void mesh_handle_ctrl(const wsn_packet_t& pkt) {
   switch (cp.cmd) {
     case CTRL_COLLISION_TEST:
       mesh.collision_test_trigger = true;
-      Serial.println("[CTRL] Collision test triggered!");
+      Serial.println("[CTRL] Collision test armed (N1/N2 will contend at the start of the next CAP)");
       break;
 
     case CTRL_KILL_LINK:
       if (cp.param1 == MY_NODE_ID || cp.param2 == MY_NODE_ID) {
         uint8_t other = (cp.param1 == MY_NODE_ID) ? cp.param2 : cp.param1;
-        mesh.killed_links[other] = true;
-        mesh.neighbors[other].link_alive = false;
-        Serial.printf("[CTRL] Software link kill: N%d↔N%d\n", cp.param1, cp.param2);
-        routing_recompute_next_hop();
+        if (other >= 1 && other <= NUM_NODES) {
+          Serial.printf("[CTRL] Software link kill (failure injection): N%d↔N%d\n", cp.param1, cp.param2);
+          routing_mark_link_dead(other, "software link kill");
+          mesh.killed_links[other] = true;
+          routing_recompute_next_hop();
+        }
       }
       break;
 
     case CTRL_RESTORE_LINKS:
-      for (int i = 1; i <= NUM_NODES; i++) {
-        mesh.killed_links[i] = false;
-      }
-      Serial.println("[CTRL] All software link kills restored");
+      for (int i = 1; i <= NUM_NODES; i++) mesh.killed_links[i] = false;
+      Serial.println("[CTRL] All software link kills restored (links come back on next HELLO/BEACON)");
+      mesh.hello_triggered = true;
       routing_recompute_next_hop();
       break;
   }
@@ -878,7 +1178,6 @@ void mesh_handle_ctrl(const wsn_packet_t& pkt) {
 //                    MESH INIT & PERIODIC LOOP
 // =====================================================================
 
-// --- Initialize the full mesh stack ---
 void mesh_init() {
   memset(&mesh, 0, sizeof(mesh));
   mesh.my_id = MY_NODE_ID;
@@ -887,14 +1186,11 @@ void mesh_init() {
   mesh.next_hop_to_sink = 0;
   mesh.data_seq_counter = 1;
   mesh.ctrl_seq_counter = 1;
-  mesh.fwd_queue.head = 0;
-  mesh.fwd_queue.tail = 0;
-  mesh.fwd_queue.count = 0;
+  randomSeed(esp_random());
 
   routing_init();
   tdma_init();
 
-  // Init ESP-NOW
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     Serial.println("[MESH] ESP-NOW init FAILED!");
@@ -904,7 +1200,6 @@ void mesh_init() {
   esp_now_register_recv_cb(mesh_on_recv);
   esp_now_register_send_cb(mesh_on_sent);
 
-  // Add all other nodes as ESP-NOW peers
   for (int i = 1; i <= NUM_NODES; i++) {
     if (i == MY_NODE_ID) continue;
     esp_now_peer_info_t peer = {};
@@ -916,225 +1211,218 @@ void mesh_init() {
     }
   }
 
-  // Add broadcast peer
   esp_now_peer_info_t bcast = {};
   memcpy(bcast.peer_addr, BROADCAST_MAC, 6);
   bcast.channel = 0;
   bcast.encrypt = false;
   esp_now_add_peer(&bcast);
 
-  // Enable promiscuous mode for software CCA
-  esp_wifi_set_promiscuous(true);
+  // Promiscuous sniffing (management frames only) for software CCA
+  wifi_promiscuous_filter_t filt = {};
+  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+  esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(promisc_rx_cb);
+  esp_wifi_set_promiscuous(true);
 
-  Serial.printf("[MESH] Initialized: N%d (%s)\n", MY_NODE_ID, roleStr(mesh.my_role));
-  Serial.printf("[MESH] MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-    NODE_MAC[MY_NODE_ID][0], NODE_MAC[MY_NODE_ID][1],
-    NODE_MAC[MY_NODE_ID][2], NODE_MAC[MY_NODE_ID][3],
-    NODE_MAC[MY_NODE_ID][4], NODE_MAC[MY_NODE_ID][5]);
+  uint8_t ch = 0;
+  wifi_second_chan_t sec;
+  esp_wifi_get_channel(&ch, &sec);
+  Serial.printf("[MESH] Initialized: N%d (%s) | ESP-NOW on Wi-Fi channel %d\n",
+                MY_NODE_ID, roleStr(mesh.my_role), ch);
+  Serial.printf("[MESH] My MAC: %s\n", WiFi.macAddress().c_str());
 }
 
-// --- Periodic mesh tasks — call from loop() ---
 void mesh_loop() {
   uint32_t now = millis();
 
-  // Process pending forwarding queue in main loop context (Defect 1 & 3 fix)
-  // When synced, relays forward strictly during their assigned RELAY slot (or during CAP)
+  tdma_tick();
   tdma_epoch_t epoch = tdma_current_epoch();
-  bool can_forward = (!mesh.tdma.synced) || tdma_is_my_relay_slot() || (epoch == EPOCH_CAP);
-  if (can_forward) {
-    while (mesh.fwd_queue.count > 0) {
-      wsn_packet_t fwd = mesh.fwd_queue.queue[mesh.fwd_queue.tail];
-      mesh.fwd_queue.tail = (mesh.fwd_queue.tail + 1) % FWD_QUEUE_SIZE;
-      mesh.fwd_queue.count--;
-      routing_forward(fwd);
-    }
-  }
 
-  // Duty cycle / sleep tracking and modem sleep (Defect 5 fix)
-  if (epoch != mesh.tdma.last_epoch) {
-    uint32_t dt = now - mesh.tdma.last_epoch_switch_ms;
-    if (mesh.tdma.last_epoch == EPOCH_SLEEP) {
-      mesh.tdma.sleep_time_ms += dt;
-    } else {
-      mesh.tdma.active_time_ms += dt;
+  // 0. Synchronisation maintenance (N1–N3)
+  if (MY_NODE_ID != SINK_ID) {
+    if (mesh.tdma.synced && now - mesh.tdma.last_sync_ms > SYNC_LOST_MS) {
+      mesh.tdma.synced = false;
+      mesh.tdma.synced_from_beacon = false;
+      Serial.printf("[TDMA] *** Sync lost (no beacon / synced HELLO for %lu ms) — rescanning channels ***\n",
+                    (unsigned long)(now - mesh.tdma.last_sync_ms));
     }
-    // Put Wi-Fi modem to sleep during sleep epoch (N4 stays awake for WiFi/cloud)
-    if (MY_NODE_ID != 4) {
-      if (epoch == EPOCH_SLEEP) {
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-      } else {
-        esp_wifi_set_ps(WIFI_PS_NONE);
+    if (!mesh.tdma.synced) {
+      static uint32_t lastChannelHop = 0;
+      static uint8_t currentChannel = 1;
+      if (now - lastChannelHop >= 1200) {
+        lastChannelHop = now;
+        currentChannel++;
+        if (currentChannel > 13) currentChannel = 1;
+        esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+        Serial.printf("[MESH] Scanning Wi-Fi Channel %d for N4 beacon...\n", currentChannel);
       }
     }
-    mesh.tdma.last_epoch = epoch;
-    mesh.tdma.last_epoch_switch_ms = now;
   }
 
-  // 0. Channel scan for nodes 1, 2, 3: hop channels every 1.2s until synced with N4
-  if (MY_NODE_ID != 4 && !mesh.tdma.synced) {
-    static uint32_t lastChannelHop = 0;
-    static uint8_t currentChannel = 1;
-    if (now - lastChannelHop >= 1200) {
-      lastChannelHop = now;
-      currentChannel++;
-      if (currentChannel > 13) currentChannel = 1;
-      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-      Serial.printf("[MESH] Scanning Wi-Fi Channel %d for N4 beacon...\n", currentChannel);
+  // 1. N4: beacon at the start of every superframe
+  if (MY_NODE_ID == SINK_ID && epoch == EPOCH_BEACON) {
+    static uint32_t last_beacon_frame = 0xFFFFFFFF;
+    uint32_t frame = tdma_current_frame();
+    if (frame != last_beacon_frame) {
+      last_beacon_frame = frame;
+      tdma_send_beacon();
     }
   }
 
-  // 1. Periodic HELLO broadcast (every 2s during CAP or anytime if not synced)
-  if (now - mesh.last_hello_ms >= HELLO_INTERVAL_MS) {
-    if (!mesh.tdma.synced || epoch == EPOCH_CAP) {
+  // 2. Control traffic in the CAP (or any time while unsynced)
+  if (mesh_ctrl_window_open() && tdma_epoch_remaining_ms() > 10) {
+    if (mesh.route_update_pending) {
+      mesh.route_update_pending = false;
+      wsn_packet_t rupkt;
+      initPacket(rupkt, MSG_ROUTE_UPDATE, BROADCAST_ID, MY_NODE_ID, BROADCAST_ID, mesh.ctrl_seq_counter++);
+      setPayload(rupkt, mesh.route_update_payload);
+      mac_send_broadcast(rupkt, true);
+    }
+    if (mesh.sched_is_coordinator &&
+        (mesh.sched_announce_pending || now - mesh.last_sched_announce_ms >= SCHED_REBROADCAST_MS)) {
+      bool changed = mesh.sched_announce_pending;
+      mesh.sched_announce_pending = false;
+      tdma_announce_schedule(changed);
+    }
+    if ((mesh.hello_triggered && now - mesh.last_hello_ms >= HELLO_MIN_GAP_MS) ||
+        now - mesh.last_hello_ms >= HELLO_INTERVAL_MS) {
       routing_send_hello();
-      mesh.last_hello_ms = now;
     }
   }
 
-  // 2. HELLO timeout check (mark dead neighbors)
+  // 3. Neighbour liveness
   routing_check_timeouts();
 
-  // 3. N4: Send beacon at start of each superframe
-  if (MY_NODE_ID == 4 && mesh.tdma.synced) {
-    static uint32_t last_beacon = 0;
-    if (now - last_beacon >= SUPERFRAME_MS) {
-      tdma_send_beacon();
-      last_beacon = now;
-    }
-  } else if (MY_NODE_ID == 4 && !mesh.tdma.synced) {
-    mesh.tdma.synced = true;
-    mesh.tdma.clock_offset = 0;
-    tdma_send_beacon();
-  }
-
-  // 4. N3: Periodic schedule rebroadcast (every 6 seconds so nodes never stay unscheduled)
-  if (MY_NODE_ID == 3 && mesh.tdma.synced) {
-    static uint32_t last_schedule_rebroadcast = 0;
-    if (now - last_schedule_rebroadcast >= 6000) {
-      tdma_send_default_schedule("PERIODIC: schedule refresh");
-      last_schedule_rebroadcast = now;
-    }
-  }
+  // 4. Forward queued transit packets (relay slot or CAP)
+  mesh_service_forward_queue();
 }
 
 // =====================================================================
-//            CONVENIENCE: Send sensor data to sink via mesh
+//            OWN PACKETS: build, buffer, (re)transmit
 // =====================================================================
 
-// Build and send a MSG_DATA packet through the routing layer
-bool mesh_send_sensor_data(float v1, float v2, float v3, const char* sensor_type) {
-  if (mesh.next_hop_to_sink == 0) {
-    Serial.println("[MESH] Cannot send data — no route to sink");
-    return false;
-  }
+bool mesh_own_tx_busy(uint8_t idx) { return mesh.own_tx[idx].active; }
 
+void mesh_own_tx_load(uint8_t idx, const wsn_packet_t& pkt) {
+  mesh.own_tx[idx].pkt = pkt;
+  mesh.own_tx[idx].attempts = 0;
+  mesh.own_tx[idx].defer_key = 0xFFFFFFFF;
+  mesh.own_tx[idx].active = true;
+}
+
+// Transmit (or continue transmitting) a buffered own packet in the current window
+mac_result_t mesh_own_tx_service(uint8_t idx) {
+  own_tx_t& o = mesh.own_tx[idx];
+  if (!o.active) return MAC_OK;
+  uint32_t key = mesh_tx_opportunity_key();
+  if (o.defer_key == key) return MAC_DEFERRED;   // wait for the next slot/CAP
+  uint8_t next = mesh.next_hop_to_sink;
+  if (next == 0) return MAC_NO_ROUTE;      // keep it until a route exists
+  o.pkt.dst_id = next;                     // route may have changed since creation
+  mac_result_t r = mac_send(o.pkt, o.attempts, tdma_epoch_deadline());
+  if (r == MAC_OK || r == MAC_DROPPED) o.active = false;
+  if (r == MAC_DEFERRED) o.defer_key = key;
+  return r;
+}
+
+wsn_packet_t mesh_build_sensor_packet(float v1, float v2, float v3, const char* sensor_type) {
   wsn_packet_t pkt;
-  initPacket(pkt, MSG_DATA, mesh.next_hop_to_sink, MY_NODE_ID, 4, mesh.data_seq_counter++);
-  pkt.route_path[0] = MY_NODE_ID;
-
+  initPacket(pkt, MSG_DATA, mesh.next_hop_to_sink, MY_NODE_ID, SINK_ID, mesh.data_seq_counter++);
   sensor_payload_t sp;
+  memset(&sp, 0, sizeof(sp));
   sp.val1 = v1;
   sp.val2 = v2;
   sp.val3 = v3;
   strncpy(sp.sensor_type, sensor_type, sizeof(sp.sensor_type) - 1);
-  sp.sensor_type[sizeof(sp.sensor_type) - 1] = '\0';
   setPayload(pkt, sp);
-
-  return mac_send(pkt);
+  return pkt;
 }
 
-// Build and send a MSG_AGG packet through the routing layer (N3)
-bool mesh_send_agg_data(const agg_payload_t& agg) {
-  if (mesh.next_hop_to_sink == 0) {
-    Serial.println("[MESH] Cannot send AGG — no route to sink");
-    return false;
-  }
-
+wsn_packet_t mesh_build_agg_packet(const agg_payload_t& agg) {
   wsn_packet_t pkt;
-  initPacket(pkt, MSG_AGG, mesh.next_hop_to_sink, MY_NODE_ID, 4, mesh.data_seq_counter++);
-  pkt.route_path[0] = MY_NODE_ID;
+  initPacket(pkt, MSG_AGG, mesh.next_hop_to_sink, MY_NODE_ID, SINK_ID, mesh.data_seq_counter++);
   setPayload(pkt, agg);
-
-  return mac_send(pkt);
+  return pkt;
 }
 
-// Send BLE report to sink
-bool mesh_send_ble_report(const ble_report_payload_t& rpt) {
-  if (MY_NODE_ID == 4) {
-    return true;  // N4 processes locally, no transmission needed (Defect fix: avoid null dereference)
-  }
-  if (mesh.next_hop_to_sink == 0) {
-    Serial.println("[MESH] Cannot send BLE report — no route to sink");
-    return false;
-  }
-
+wsn_packet_t mesh_build_ble_report_packet(const ble_report_payload_t& rpt) {
   wsn_packet_t pkt;
-  initPacket(pkt, MSG_BLE_REPORT, mesh.next_hop_to_sink, MY_NODE_ID, 4, mesh.ctrl_seq_counter++);
+  initPacket(pkt, MSG_BLE_REPORT, mesh.next_hop_to_sink, MY_NODE_ID, SINK_ID, mesh.ctrl_seq_counter++);
   setPayload(pkt, rpt);
-  return mac_send(pkt);
+  return pkt;
 }
 
 // =====================================================================
-//           CONVENIENCE: Collision test sender (N1 and N2)
+//           CONTENTION DEMO: Collision test sender (N1 and N2)
 // =====================================================================
-
-// Called from loop() when collision_test_trigger is set
-void mesh_collision_test_send() {
+// After CTRL_COLLISION_TEST, N1 and N2 both wait for the start of the next
+// CAP and then transmit to their next hop at the same moment. CCA + random
+// backoff decide who goes first; the loser senses the winner's frame and
+// defers (log: "[MAC] Contention: channel taken during backoff").
+void mesh_collision_test_service() {
   if (!mesh.collision_test_trigger) return;
+  if (MY_NODE_ID != 1 && MY_NODE_ID != 2) { mesh.collision_test_trigger = false; return; }
+  if (mesh.tdma.synced && (tdma_current_epoch() != EPOCH_CAP || tdma_epoch_remaining_ms() < CAP_DURATION_MS - 20)) return;
+  if (mesh.next_hop_to_sink == 0) return;
   mesh.collision_test_trigger = false;
 
-  Serial.println("[COLLISION TEST] Sending data immediately (no TDMA slot check)!");
-
-  // Build a test packet
-  wsn_packet_t pkt;
-  initPacket(pkt, MSG_DATA, mesh.next_hop_to_sink, MY_NODE_ID, 4, mesh.ctrl_seq_counter++);
-  sensor_payload_t sp;
-  sp.val1 = 999.0f;
-  sp.val2 = 999.0f;
-  sp.val3 = 999.0f;
-  strncpy(sp.sensor_type, "colltest", sizeof(sp.sensor_type) - 1);
-  setPayload(pkt, sp);
-
-  // Send immediately — CCA will detect contention
-  mac_send(pkt);
+  Serial.printf("[COLLISION TEST] CAP start (synced t=%lu) — contending for the channel now\n",
+                (unsigned long)(tdma_synced_time() % SUPERFRAME_MS));
+  // Use the normal own-packet buffer so a deferred/lost test frame is retried
+  if (!mesh_own_tx_busy(OWN_TX_DATA)) {
+    mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(0, 0, 0, "colltest"));
+  }
+  mac_result_t r = mesh_own_tx_service(OWN_TX_DATA);
+  Serial.printf("[COLLISION TEST] Result: %s (attempts=%d), backoffs so far=%lu, CCA busy so far=%lu\n",
+                r == MAC_OK ? "DELIVERED (ACK)" : (r == MAC_DEFERRED ? "DEFERRED to next slot/CAP" : "FAILED"),
+                mesh.own_tx[OWN_TX_DATA].attempts, (unsigned long)mesh.mac_stats.total_backoffs,
+                (unsigned long)mesh.mac_stats.cca_busy_count);
 }
 
-// Print mesh status summary
+// =====================================================================
+//                         STATUS
+// =====================================================================
 void mesh_print_status() {
   Serial.println("\n====== MESH STATUS ======");
-  Serial.printf("Node: N%d (%s)\n", MY_NODE_ID, roleStr(mesh.my_role));
-  Serial.printf("Next hop to sink: N%d\n", mesh.next_hop_to_sink);
-  Serial.printf("TDMA synced: %s | Frame: %lu\n",
-    mesh.tdma.synced ? "YES" : "NO", mesh.tdma.frame_number);
+  Serial.printf("Node: N%d (%s) | next hop to sink: %s (cost=%.2f, hops=%d)\n",
+                MY_NODE_ID, roleStr(mesh.my_role),
+                mesh.next_hop_to_sink ? nodeIdStr(mesh.next_hop_to_sink) : "NONE",
+                mesh.next_hop_cost, routing_my_hops());
+  Serial.printf("TDMA synced: %s (%s) | Frame: %lu | Schedule v%u from N%d (%s)\n",
+    mesh.tdma.synced ? "YES" : "NO", mesh.tdma.synced_from_beacon ? "beacon" : "neighbour",
+    (unsigned long)tdma_current_frame(), mesh.tdma.sched_version, mesh.tdma.sched_issuer, mesh.tdma.sched_reason);
 
   uint32_t total_time = mesh.tdma.active_time_ms + mesh.tdma.sleep_time_ms;
   float duty_cycle = (total_time > 0) ? (mesh.tdma.active_time_ms * 100.0f / total_time) : 100.0f;
-  Serial.printf("Duty cycle: %.1f%% (active=%lu ms, sleep=%lu ms)\n",
-    duty_cycle, mesh.tdma.active_time_ms, mesh.tdma.sleep_time_ms);
+  Serial.printf("Duty cycle: %.1f%% (active=%lu ms, idle/sleep=%lu ms) | unused own slots=%lu\n",
+    duty_cycle, (unsigned long)mesh.tdma.active_time_ms, (unsigned long)mesh.tdma.sleep_time_ms,
+    (unsigned long)mesh.tdma.unused_slots);
 
-  Serial.println("--- Neighbors ---");
+  Serial.println("--- Neighbour / routing table ---");
   for (int i = 1; i <= NUM_NODES; i++) {
     if (i == MY_NODE_ID) continue;
     route_neighbor_t& nb = mesh.neighbors[i];
-    Serial.printf("  N%d: %s | RSSI=%d | ACK=%.0f%% | hops=%d | kill=%s | retries=%u\n",
+    float c = routing_cost(i);
+    char cost[12];
+    if (c >= ROUTE_INFINITY) snprintf(cost, sizeof(cost), "inf");
+    else snprintf(cost, sizeof(cost), "%.2f", c);
+    Serial.printf("  N%d: %s | RSSI=%d | ACK=%.0f%% | hops=%d | via=%s | cost=%s | kill=%s | retries=%u\n",
       i, nb.link_alive ? "ALIVE" : "DEAD",
       nb.wifi_rssi, nb.ack_success_rate * 100,
-      nb.hops_to_sink, mesh.killed_links[i] ? "YES" : "NO",
-      nb.reported_retries);
+      nb.hops_to_sink, nb.next_hop ? nodeIdStr(nb.next_hop) : "-", cost,
+      mesh.killed_links[i] ? "YES" : "NO", nb.reported_retries);
   }
   Serial.printf("--- MAC Stats ---\n");
-  Serial.printf("  CCA busy=%lu backoffs=%lu retries=%lu drops=%lu ACKs=%lu timeouts=%lu\n",
-    mesh.mac_stats.cca_busy_count, mesh.mac_stats.total_backoffs,
-    mesh.mac_stats.total_retries, mesh.mac_stats.total_drops,
-    mesh.mac_stats.total_acks_ok, mesh.mac_stats.total_acks_timeout);
-  if (MY_NODE_ID == 4) {
-    Serial.printf("  Sent=%lu Fwd=%lu RxAtSink=%lu\n",
-      mesh.pkts_sent, mesh.pkts_forwarded, mesh.pkts_received_at_sink);
-  } else {
-    Serial.printf("  Sent=%lu Fwd=%lu\n",
-      mesh.pkts_sent, mesh.pkts_forwarded);
-  }
+  Serial.printf("  CCA busy=%lu backoffs=%lu tx_attempts=%lu retransmissions=%lu drops=%lu ACKs=%lu timeouts=%lu deferrals=%lu reroutes=%lu dup_rx=%lu malformed=%lu\n",
+    (unsigned long)mesh.mac_stats.cca_busy_count, (unsigned long)mesh.mac_stats.total_backoffs,
+    (unsigned long)mesh.mac_stats.total_tx_attempts, (unsigned long)mesh.mac_stats.total_retries,
+    (unsigned long)mesh.mac_stats.total_drops, (unsigned long)mesh.mac_stats.total_acks_ok,
+    (unsigned long)mesh.mac_stats.total_acks_timeout, (unsigned long)mesh.mac_stats.total_deferrals,
+    (unsigned long)mesh.mac_stats.total_reroutes, (unsigned long)mesh.mac_stats.dup_rx,
+    (unsigned long)mesh.mac_stats.malformed_rx);
+  Serial.printf("  Sent=%lu Fwd=%lu FwdQueue=%d%s\n",
+    (unsigned long)mesh.pkts_sent, (unsigned long)mesh.pkts_forwarded, mesh.fwd_queue.count,
+    MY_NODE_ID == SINK_ID ? "" : "");
   Serial.println("=========================\n");
 }
 

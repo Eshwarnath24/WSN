@@ -1,7 +1,8 @@
 // ==================== NODE 2: FLAME SENSOR + RELAY ====================
 // Full mesh participant: BLE + CSMA/CA MAC + TDMA + Routing + Forwarding
 // Sensor: IR Optical Flame Detection (Analog AO + Digital DO)
-// Additional role: RELAY — forwards packets from N1 or N3 when needed
+// Additional role: RELAY — forwards packets (e.g. N3's AGG when the N3–N4
+// link fails) in its TDMA RELAY slot (S4) or in the CAP.
 // Primary route: N2 → N3 → N4    Alternate: N2 → N4 (direct)
 // ======================================================================
 
@@ -17,8 +18,8 @@
 #endif
 
 // ==================== SENSOR CONFIG ====================
-#define FLAME_AO_PIN 32    // Analog flame intensity (0–4095)
-#define FLAME_DO_PIN 16    // Digital threshold (0 = fire, 1 = normal)
+#define FLAME_AO_PIN 32    // Analog flame output (ADC1_CH4, 0–4095; usable while Wi-Fi is on)
+#define FLAME_DO_PIN 16    // Digital comparator output (0 = fire, 1 = normal)
 #define SENSOR_READ_INTERVAL_MS 250
 
 // Latest sensor readings
@@ -32,37 +33,38 @@ uint32_t lastStatusPrint = 0;
 uint32_t lastBleReport = 0;
 
 // ==================== APP CALLBACKS ====================
-// Called when a packet with final_dst=N2 arrives (rare — N2 is not the sink).
-// Also called when N2 receives data it needs to forward (handled by mesh layer).
 void app_on_data_for_me(const wsn_packet_t& pkt, int rssi) {
   Serial.printf("[APP] Data arrived for N2: type=%s origin=N%d seq=%d\n",
     msgTypeStr(pkt.msg_type), pkt.origin_id, pkt.seq_num);
 }
 
-// Called when data transits through us (intermediate hop). Return true to consume.
+// Intermediate hop: N2 is a relay — forward normally (queued for RELAY slot / CAP)
 bool app_on_data_transit(const wsn_packet_t& pkt, int rssi) {
-  return false;  // N2 is a relay — forward normally
+  Serial.printf("[RELAY] Relaying %s from origin N%d seq=%d (prev hop N%d)\n",
+                msgTypeStr(pkt.msg_type), pkt.origin_id, pkt.seq_num, pkt.src_id);
+  return false;
 }
 
-// Called on CTRL commands
 void app_on_ctrl(ctrl_cmd_t cmd, uint8_t p1, uint8_t p2) {
-  // Collision test handled automatically by mesh_collision_test_send()
+  // Collision test is handled by mesh_collision_test_service()
 }
 
 // ==================== SETUP ====================
 void setup() {
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n===== NODE 2 (Flame Sensor + Relay) BOOTING =====");
 
-  // 1. Initialize sensor pins
+  // 1. Sensor pins
   pinMode(FLAME_DO_PIN, INPUT);
   Serial.println("[SENSOR] Flame sensor pins configured (AO=GPIO32, DO=GPIO16)");
 
-  // 2. Initialize BLE
+  // 2. BLE + boot-time discovery
   ble_init();
+  ble_boot_discovery();
 
-  // 3. Initialize mesh stack
+  // 3. Mesh stack
   mesh_init();
 
   Serial.println("===== N2 SETUP COMPLETE =====\n");
@@ -72,71 +74,63 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // 1. Mesh periodic tasks (HELLO, timeouts, and RELAY slot forwarding)
+  // 1. Mesh periodic tasks (sync, HELLO, RELAY-slot forwarding)
   mesh_loop();
 
-  // 2. Handle collision test trigger
-  mesh_collision_test_send();
+  // 2. Contention demo
+  mesh_collision_test_service();
 
-  // 3. BLE scan during sleep epoch
-  tdma_epoch_t epoch = tdma_current_epoch();
-  if (epoch == EPOCH_SLEEP && now - mesh.last_ble_scan_ms >= 3000) {
-    ble_scan();
-    mesh.last_ble_scan_ms = now;
-  }
+  // 3. BLE scan burst in SLEEP epoch
+  ble_tick();
 
-  // 4. Send BLE report periodically
-  if (now - lastBleReport >= 10000) {
+  // 4. BLE report every 10 s (CAP)
+  if (now - lastBleReport >= BLE_REPORT_PERIOD_MS && !mesh_own_tx_busy(OWN_TX_BLE)) {
     lastBleReport = now;
     ble_report_payload_t rpt = ble_build_report();
     if (rpt.num_neighbors > 0) {
-      mesh_send_ble_report(rpt);
+      mesh_own_tx_load(OWN_TX_BLE, mesh_build_ble_report_packet(rpt));
     }
+  }
+  if (mesh_own_tx_busy(OWN_TX_BLE) && mesh_ctrl_window_open()) {
+    mesh_own_tx_service(OWN_TX_BLE);
   }
 
   // 5. Read sensor (buffer latest sample)
   if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
     lastSensorRead = now;
-
     flameAnalog = (float)analogRead(FLAME_AO_PIN);
     flameDigital = (float)digitalRead(FLAME_DO_PIN);
     hasNewSensorData = true;
-
-    Serial.printf("[SENSOR] Flame: analog=%.0f digital=%.0f (%s)\n",
-                  flameAnalog, flameDigital,
-                  flameDigital == 0 ? "FIRE DETECTED!" : "Normal");
+    static uint8_t printDiv = 0;
+    if (++printDiv >= 4) {
+      printDiv = 0;
+      Serial.printf("[SENSOR] Flame: analog=%.0f digital=%.0f (%s)\n",
+                    flameAnalog, flameDigital,
+                    flameDigital == 0 ? "FIRE DETECTED!" : "Normal");
+    }
   }
 
-  // 6. Transmit sensor data strictly during assigned TDMA TX slot (Defect 3 fix)
-  static tdma_epoch_t last_tx_slot = EPOCH_SLEEP;
-  static uint32_t last_tx_frame = 0xFFFFFFFF;
-  uint32_t current_frame = mesh.tdma.frame_number;
-  tdma_epoch_t curr_epoch = tdma_current_epoch();
-
-  if (mesh.tdma.synced) {
-    // Only transmit own sensor data during assigned TX slot (Slot 2)
-    if (tdma_is_my_tx_slot()) {
-      if (curr_epoch != last_tx_slot || current_frame != last_tx_frame) {
-        if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
-          mesh_send_sensor_data(flameAnalog, flameDigital, 0, "flame");
-          hasNewSensorData = false;
-          last_tx_slot = curr_epoch;
-          last_tx_frame = current_frame;
-        }
-      }
-    } else {
-      last_tx_slot = curr_epoch;
-    }
-  } else {
-    // Free-running fallback when unsynced: transmit every 1s
-    static uint32_t lastUnsyncedTx = 0;
-    if (now - lastUnsyncedTx >= 1000) {
-      lastUnsyncedTx = now;
-      if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
-        mesh_send_sensor_data(flameAnalog, flameDigital, 0, "flame");
+  // 6. TDMA: one new packet per assigned TX slot occurrence (S2)
+  static uint32_t lastOpportunity = 0xFFFFFFFF;
+  if (mesh_data_window_open()) {
+    uint32_t key = mesh_tx_opportunity_key();
+    if (key != lastOpportunity) {
+      lastOpportunity = key;
+      if (mesh_own_tx_busy(OWN_TX_DATA)) {
+        // previous packet still pending → retransmitted below
+      } else if (hasNewSensorData && mesh.next_hop_to_sink != 0) {
+        mesh_own_tx_load(OWN_TX_DATA, mesh_build_sensor_packet(flameAnalog, flameDigital, 0, "flame"));
         hasNewSensorData = false;
+        Serial.printf("[TDMA] %s: TX opportunity — sending flame reading seq=%d via N%d\n",
+                      epochStr(tdma_current_epoch()), mesh.own_tx[OWN_TX_DATA].pkt.seq_num,
+                      mesh.next_hop_to_sink);
+      } else if (mesh.tdma.synced) {
+        mesh_note_unused_slot(hasNewSensorData ? "no route to sink" : "no new sensor sample");
       }
     }
+  }
+  if (mesh_own_tx_busy(OWN_TX_DATA) && mesh_retry_window_open()) {
+    mesh_own_tx_service(OWN_TX_DATA);
   }
 
   // 7. Print status periodically
